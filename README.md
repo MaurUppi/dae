@@ -18,6 +18,7 @@
             - e.g. pname(nginx) -> redirect(lo, egress)
     - [ci: Bump little-vm-helper: 0.0.23 -> 0.0.28](https://github.com/daeuniverse/dae/pull/913) (#913) verified
     - [fix: support absolute paths in include directive](https://github.com/daeuniverse/dae/pull/908) (#908) verified
+    - [fix(tproxy): avoid conflicts with LAN ingress by filtering direct routing](https://github.com/daeuniverse/dae/pull/925) (#925) verified
 
 <img src="https://github.com/daeuniverse/dae/blob/main/logo.png" border="0" width="25%">
 
