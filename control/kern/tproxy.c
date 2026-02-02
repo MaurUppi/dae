@@ -45,7 +45,6 @@
 #define MAX_LPM_SIZE 2048000
 #define MAX_LPM_NUM (MAX_MATCH_SET_LEN + 8)
 #define MAX_DST_MAPPING_NUM (65536 * 2)
-#define MAX_TGID_PNAME_MAPPING_NUM (8192)
 #define MAX_COOKIE_PID_PNAME_MAPPING_NUM (65536)
 #define MAX_DOMAIN_ROUTING_NUM 65536
 #define MAX_ARG_LEN 128
@@ -166,15 +165,6 @@ struct dae_param {
 };
 
 static volatile const struct dae_param PARAM = {};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__type(key, __u32); // tgid
-	__type(value, __u32[TASK_COMM_LEN / 4]); // process name.
-	__uint(max_entries, MAX_TGID_PNAME_MAPPING_NUM);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-} tgid_pname_map
-	SEC(".maps"); // This map is only for old method (redirect mode in WAN).
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -1805,7 +1795,8 @@ static __always_inline int get_pid_pname(struct pid_pname *pid_pname)
 	return 0;
 }
 
-static __always_inline int _update_map_elem_by_cookie(const __u64 cookie)
+static __always_inline int _update_map_elem_by_cookie(const __u64 cookie,
+						      struct pid_pname *val)
 {
 	if (unlikely(!cookie)) {
 		bpf_printk("zero cookie");
@@ -1817,20 +1808,17 @@ static __always_inline int _update_map_elem_by_cookie(const __u64 cookie)
 	}
 
 	int ret;
-	// Build value.
-	struct pid_pname val = { 0 };
 
-	ret = get_pid_pname(&val);
+	ret = get_pid_pname(val);
 	if (ret)
 		return ret;
 
 	// Update map.
-	ret = bpf_map_update_elem(&cookie_pid_map, &cookie, &val, BPF_ANY);
+	ret = bpf_map_update_elem(&cookie_pid_map, &cookie, val, BPF_ANY);
 	if (unlikely(ret)) {
 		// bpf_printk("setup_mapping_from_sk: failed update map: %d", ret);
 		return ret;
 	}
-	bpf_map_update_elem(&tgid_pname_map, &val.pid, &val.pname, BPF_ANY);
 
 #ifdef __PRINT_SETUP_PROCESS_CONNNECTION
 	bpf_printk("setup_mapping: %llu -> %s (%d)", cookie, val.pname,
@@ -1842,22 +1830,12 @@ static __always_inline int _update_map_elem_by_cookie(const __u64 cookie)
 static __always_inline int update_map_elem_by_cookie(const __u64 cookie)
 {
 	int ret;
+	struct pid_pname val = {};
 
-	ret = _update_map_elem_by_cookie(cookie);
+	ret = _update_map_elem_by_cookie(cookie, &val);
 	if (ret) {
 		// Fallback to only write pid to avoid loop due to packets sent by dae.
-		struct pid_pname val = { 0 };
-
 		val.pid = bpf_get_current_pid_tgid() >> 32;
-		__u32(*pname)[TASK_COMM_LEN] =
-			bpf_map_lookup_elem(&tgid_pname_map, &val.pid);
-		if (pname) {
-			__builtin_memcpy(val.pname, *pname, TASK_COMM_LEN);
-			ret = 0;
-			bpf_printk("fallback [retrieve pname]: %u", val.pid);
-		} else {
-			bpf_printk("failed [retrieve pname]: %u", val.pid);
-		}
 		bpf_map_update_elem(&cookie_pid_map, &cookie, &val, BPF_ANY);
 		return ret;
 	}
@@ -1912,124 +1890,6 @@ int tproxy_wan_cg_sendmsg6(struct bpf_sock_addr *ctx)
 {
 	update_map_elem_by_cookie(bpf_get_socket_cookie(ctx));
 	return 1;
-}
-
-SEC("sockops")
-int local_tcp_sockops(struct bpf_sock_ops *skops)
-{
-	struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-	__u32 pid = BPF_CORE_READ(task, pid);
-
-	/* Only local TCP connection has non-zero pids. */
-	if (pid == 0)
-		return 0;
-
-	struct tuples_key tuple = {};
-
-	tuple.l4proto = IPPROTO_TCP;
-	tuple.sport = bpf_htonl(skops->local_port) >> 16;
-	tuple.dport = skops->remote_port >> 16;
-	if (skops->family == AF_INET) {
-		tuple.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		tuple.sip.u6_addr32[3] = skops->local_ip4;
-		tuple.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		tuple.dip.u6_addr32[3] = skops->remote_ip4;
-	} else if (skops->family == AF_INET6) {
-		tuple.sip.u6_addr32[3] = skops->local_ip6[3];
-		tuple.sip.u6_addr32[2] = skops->local_ip6[2];
-		tuple.sip.u6_addr32[1] = skops->local_ip6[1];
-		tuple.sip.u6_addr32[0] = skops->local_ip6[0];
-		tuple.dip.u6_addr32[3] = skops->remote_ip6[3];
-		tuple.dip.u6_addr32[2] = skops->remote_ip6[2];
-		tuple.dip.u6_addr32[1] = skops->remote_ip6[1];
-		tuple.dip.u6_addr32[0] = skops->remote_ip6[0];
-	} else {
-		return 0;
-	}
-
-	switch (skops->op) {
-	case BPF_SOCK_OPS_PASSIVE_ESTABLISHED_CB: // dae sockets
-	{
-		struct tuples_key rev_tuple = {};
-
-		copy_reversed_tuples(&tuple, &rev_tuple);
-
-		struct routing_result *routing_result;
-
-		routing_result =
-			bpf_map_lookup_elem(&routing_tuples_map, &rev_tuple);
-		if (!routing_result || !routing_result->pid)
-			break;
-
-		if (!bpf_sock_hash_update(skops, &fast_sock, &tuple, BPF_ANY))
-			bpf_printk("fast_sock added: %pI4:%lu -> %pI4:%lu",
-				   &tuple.sip.u6_addr32[3],
-				   bpf_ntohs(tuple.sport),
-				   &tuple.dip.u6_addr32[3],
-				   bpf_ntohs(tuple.dport));
-		break;
-	}
-
-	case BPF_SOCK_OPS_ACTIVE_ESTABLISHED_CB: // local client sockets
-	{
-		struct routing_result *routing_result;
-
-		routing_result =
-			bpf_map_lookup_elem(&routing_tuples_map, &tuple);
-		if (!routing_result || !routing_result->pid)
-			break;
-
-		if (!bpf_sock_hash_update(skops, &fast_sock, &tuple, BPF_ANY))
-			bpf_printk("fast_sock added: %pI4:%lu -> %pI4:%lu",
-				   &tuple.sip.u6_addr32[3],
-				   bpf_ntohs(tuple.sport),
-				   &tuple.dip.u6_addr32[3],
-				   bpf_ntohs(tuple.dport));
-		break;
-	}
-
-	default:
-		break;
-	}
-
-	return 0;
-}
-
-SEC("sk_msg/fast_redirect")
-int sk_msg_fast_redirect(struct sk_msg_md *msg)
-{
-	struct tuples_key rev_tuple = {};
-
-	rev_tuple.l4proto = IPPROTO_TCP;
-	rev_tuple.sport = msg->remote_port >> 16;
-	rev_tuple.dport = bpf_htonl(msg->local_port) >> 16;
-	if (msg->family == AF_INET) {
-		rev_tuple.sip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		rev_tuple.sip.u6_addr32[3] = msg->remote_ip4;
-		rev_tuple.dip.u6_addr32[2] = bpf_htonl(0x0000ffff);
-		rev_tuple.dip.u6_addr32[3] = msg->local_ip4;
-	} else if (msg->family == AF_INET6) {
-		rev_tuple.sip.u6_addr32[3] = msg->remote_ip6[3];
-		rev_tuple.sip.u6_addr32[2] = msg->remote_ip6[2];
-		rev_tuple.sip.u6_addr32[1] = msg->remote_ip6[1];
-		rev_tuple.sip.u6_addr32[0] = msg->remote_ip6[0];
-		rev_tuple.dip.u6_addr32[3] = msg->local_ip6[3];
-		rev_tuple.dip.u6_addr32[2] = msg->local_ip6[2];
-		rev_tuple.dip.u6_addr32[1] = msg->local_ip6[1];
-		rev_tuple.dip.u6_addr32[0] = msg->local_ip6[0];
-	} else {
-		return SK_PASS;
-	}
-
-	if (bpf_msg_redirect_hash(msg, &fast_sock, &rev_tuple, BPF_F_INGRESS) ==
-	    SK_PASS)
-		bpf_printk("tcp fast redirect: %pI4:%lu -> %pI4:%lu",
-			   &rev_tuple.sip.u6_addr32[3],
-			   bpf_ntohs(rev_tuple.sport),
-			   &rev_tuple.dip.u6_addr32[3],
-			   bpf_ntohs(rev_tuple.dport));
-
-	return SK_PASS;
 }
 
 SEC("license") const char __license[] = "Dual BSD/GPL";
