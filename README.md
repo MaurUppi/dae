@@ -1,5 +1,24 @@
 # dae
 
+## What's diff vs. upstream v1.1.0rc1
+- [v1.0.0](https://github.com/daeuniverse/dae/releases/tag/v1.0.0) was released May 30, 2025. A lot of good PR on waiting list.
+- [v1.1.0rc1](https://github.com/daeuniverse/dae/releases/tag/v1.1.0rc1) was released Nov 4, 2025. Added/Fixed some features.
+- Not sure when RC2 will be released, so I made some Cherry picks based on my personal preference.
+    - Jan 2, 2026 [chore: log node status and latencies in debug level #880](https://github.com/daeuniverse/dae/pull/880) verified
+        - latency check log level `info` changed to `debug`.
+    - Aug 25, 2025 [fix: Remove sockmap fast tcp redirect #912](https://github.com/daeuniverse/dae/pull/912) verified
+        - remove sockmap from dae, speed up the bpf loading process
+    - Jun 13, 2025 [optimize(bpf): Delete tgid_pname_map #839](https://github.com/daeuniverse/dae/pull/839) verified
+        - 直接删去了 cookie_pid_map 同时维持了 fallback 逻辑，减小了内核内存消耗
+        - 省去了 wan 代理时对每个 socket 的一次 map 操作，提升全局性能
+    - Jun 12, 2025 [refactor(bpf): Introduce route_decision struct #836](https://github.com/daeuniverse/dae/pull/836) verified
+        - 实现 [#818](https://github.com/daeuniverse/dae/issues/818) , 作为预备工作引入了 route_decision 结构体方便之后扩展，无业务逻辑改动
+        - 实现 redirect routing `redirect([interface_name], [ingress|egress])`
+            - e.g. dip(1.1.1.1.1) -> redirect(wlp0s20f3, ingress)
+            - e.g. pname(nginx) -> redirect(lo, egress)
+    - [ci: Bump little-vm-helper: 0.0.23 -> 0.0.28](https://github.com/daeuniverse/dae/pull/913) (#913) verified
+    - [fix: support absolute paths in include directive](https://github.com/daeuniverse/dae/pull/908) (#908) verified
+
 <img src="https://github.com/daeuniverse/dae/blob/main/logo.png" border="0" width="25%">
 
 <p align="left">
@@ -16,6 +35,8 @@ To enhance traffic split performance as much as possible, dae employs the transp
 
 As a successor of [v2rayA](https://github.com/v2rayA/v2rayA), dae abandoned v2ray-core to meet the needs of users more freely.
 
+<details><summary>Detailed Upstream repo infos</summary>
+<p>
 ## Features
 
 - [x] Implement `Real Direct` traffic split (need ipforward on) to achieve [high performance](https://docs.google.com/spreadsheets/d/1UaWU6nNho7edBNjNqC8dfGXLlW0-cm84MM7sH6Gp7UE/edit?usp=sharing).
@@ -60,3 +81,6 @@ Special thanks goes to all [contributors](https://github.com/daeuniverse/dae/gra
 ## Stargazers over time
 
 [![Stargazers over time](https://starchart.cc/daeuniverse/dae.svg)](https://starchart.cc/daeuniverse/dae)
+
+</p>
+</details> 
