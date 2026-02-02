@@ -45,6 +45,7 @@
 #define MAX_LPM_SIZE 2048000
 #define MAX_LPM_NUM (MAX_MATCH_SET_LEN + 8)
 #define MAX_DST_MAPPING_NUM (65536 * 2)
+#define MAX_TGID_PNAME_MAPPING_NUM (8192)
 #define MAX_COOKIE_PID_PNAME_MAPPING_NUM (65536)
 #define MAX_DOMAIN_ROUTING_NUM 65536
 #define MAX_ARG_LEN 128
@@ -124,14 +125,6 @@ struct ip_port {
 	__be16 port;
 };
 
-struct route_decision {
-	u32 mark;
-	u8 outbound;
-	u8 must: 1;
-	u8 error: 1;
-	u8 unused: 6;
-};
-
 struct routing_result {
 	__u32 mark;
 	__u8 must;
@@ -165,6 +158,15 @@ struct dae_param {
 };
 
 static volatile const struct dae_param PARAM = {};
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__type(key, __u32); // tgid
+	__type(value, __u32[TASK_COMM_LEN / 4]); // process name.
+	__uint(max_entries, MAX_TGID_PNAME_MAPPING_NUM);
+	__uint(pinning, LIBBPF_PIN_BY_NAME);
+} tgid_pname_map
+	SEC(".maps"); // This map is only for old method (redirect mode in WAN).
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -571,13 +573,13 @@ struct route_params {
 	const __be32 *saddr;
 	const __be32 *daddr;
 	__be32 mac[4];
-	struct route_decision decision;
 };
 
 struct route_ctx {
-	struct route_params *params;
+	const struct route_params *params;
 	__u16 h_dport;
 	__u16 h_sport;
+	__s64 result; // high -> low: sign(1b) unused(23b) mark(32b) outbound(8b)
 	struct lpm_key lpm_key_saddr, lpm_key_daddr, lpm_key_mac;
 	volatile __u8 isdns_must_goodsubrule_badrule;
 };
@@ -600,7 +602,7 @@ static int route_loop_cb(__u32 index, void *data)
 	struct domain_routing *domain_routing;
 
 	if (unlikely(index / 32 >= MAX_MATCH_SET_LEN / 32)) {
-		ctx->params->decision.error = true;
+		ctx->result = -EFAULT;
 		return 1;
 	}
 
@@ -608,7 +610,7 @@ static int route_loop_cb(__u32 index, void *data)
 
 	match_set = bpf_map_lookup_elem(&routing_map, &k);
 	if (unlikely(!match_set)) {
-		ctx->params->decision.error = true;
+		ctx->result = -EFAULT;
 		return 1;
 	}
 	if (ctx->isdns_must_goodsubrule_badrule & 0b11) {
@@ -638,7 +640,7 @@ lookup_lpm:
 #endif
 		lpm = bpf_map_lookup_elem(&lpm_array_map, &match_set->index);
 		if (unlikely(!lpm)) {
-			ctx->params->decision.error = true;
+			ctx->result = -EFAULT;
 			return 1;
 		}
 		if (bpf_map_lookup_elem(lpm, lpm_key)) {
@@ -738,7 +740,7 @@ lookup_lpm:
 			"CHECK: <unknown>, match_set->type: %u, not: %d, outbound: %u",
 			match_set->type, match_set->not, match_set->outbound);
 #endif
-		ctx->params->decision.error = true;
+		ctx->result = -EINVAL;
 		return 1;
 	}
 
@@ -765,57 +767,53 @@ before_next_loop:
 #ifdef __DEBUG_ROUTING
 	bpf_printk("_bad_rule: %d", ctx->isdns_must_goodsubrule_badrule & 0b1);
 #endif
-	if ((match_set->outbound & OUTBOUND_LOGICAL_MASK) == OUTBOUND_LOGICAL_MASK)
-		return 0;
-
-	// Tail of a rule (line).
-	// Decide whether to hit.
-	if (!(ctx->isdns_must_goodsubrule_badrule & 0b1)) {
+	if ((match_set->outbound & OUTBOUND_LOGICAL_MASK) !=
+	    OUTBOUND_LOGICAL_MASK) {
+		// Tail of a rule (line).
+		// Decide whether to hit.
+		if (!(ctx->isdns_must_goodsubrule_badrule & 0b1)) {
 #ifdef __DEBUG_ROUTING
-		bpf_printk(
-			"MATCHED: match_set->type: %u, match_set->not: %d",
-			match_set->type, match_set->not );
+			bpf_printk(
+				"MATCHED: match_set->type: %u, match_set->not: %d",
+				match_set->type, match_set->not );
 #endif
 
-		// DNS requests should routed by control plane if outbound is not
-		// must_direct.
+			// DNS requests should routed by control plane if outbound is not
+			// must_direct.
 
-		if (unlikely(match_set->outbound ==
-			     OUTBOUND_MUST_RULES)) {
-			ctx->isdns_must_goodsubrule_badrule |= 0b100;
-		} else {
-			bool must = ctx->isdns_must_goodsubrule_badrule & 0b100 ||
-						match_set->must;
+			if (unlikely(match_set->outbound ==
+				     OUTBOUND_MUST_RULES)) {
+				ctx->isdns_must_goodsubrule_badrule |= 0b100;
+			} else {
+				bool must = ctx->isdns_must_goodsubrule_badrule & 0b100 ||
+							match_set->must;
 
-			if (!must &&
-			    (ctx->isdns_must_goodsubrule_badrule &
-			     0b1000)) {
-				ctx->params->decision.outbound = OUTBOUND_CONTROL_PLANE_ROUTING;
-				ctx->params->decision.mark = match_set->mark;
-				ctx->params->decision.must = must;
+				if (!must &&
+				    (ctx->isdns_must_goodsubrule_badrule &
+				     0b1000)) {
+					ctx->result =
+						(__s64)OUTBOUND_CONTROL_PLANE_ROUTING |
+						((__s64)match_set->mark << 8) |
+						((__s64)must << 40);
 #ifdef __DEBUG_ROUTING
-				bpf_printk(
-					"OUTBOUND_CONTROL_PLANE_ROUTING: outbound=%u, mark=%x, must=%d",
-					ctx->params->decision.outbound,
-					ctx->params->decision.mark,
-					ctx->params->decision.must);
+					bpf_printk(
+						"OUTBOUND_CONTROL_PLANE_ROUTING: %ld",
+						ctx->result);
+#endif
+					return 1;
+				}
+				ctx->result = (__s64)match_set->outbound |
+					      ((__s64)match_set->mark << 8) |
+					      ((__s64)must << 40);
+#ifdef __DEBUG_ROUTING
+				bpf_printk("outbound %u: %ld",
+					   match_set->outbound, ctx->result);
 #endif
 				return 1;
 			}
-			ctx->params->decision.outbound = match_set->outbound;
-			ctx->params->decision.mark = match_set->mark;
-			ctx->params->decision.must = must;
-#ifdef __DEBUG_ROUTING
-			bpf_printk("outbound %u: mark=%x, must=%d, error=%d",
-				   match_set->outbound,
-				   ctx->params->decision.mark,
-				   ctx->params->decision.must,
-				   ctx->params->decision.error);
-#endif
-			return 1;
 		}
+		ctx->isdns_must_goodsubrule_badrule &= ~0b1;
 	}
-	ctx->isdns_must_goodsubrule_badrule &= ~0b1;
 	return 0;
 #undef _l4proto_type
 #undef _ipversion_type
@@ -824,7 +822,7 @@ before_next_loop:
 #undef _dscp
 }
 
-static __always_inline void route(struct route_params *params)
+static __always_inline __s64 route(const struct route_params *params)
 {
 #define _l4proto_type params->flag[0]
 #define _ipversion_type params->flag[1]
@@ -837,6 +835,7 @@ static __always_inline void route(struct route_params *params)
 
 	__builtin_memset(&ctx, 0, sizeof(ctx));
 	ctx.params = params;
+	ctx.result = -ENOEXEC;
 
 	// Variables for further use.
 	if (_l4proto_type == L4ProtoType_TCP) {
@@ -874,15 +873,13 @@ static __always_inline void route(struct route_params *params)
 	__builtin_memcpy(ctx.lpm_key_mac.data, params->mac, IPV6_BYTE_LENGTH);
 
 	ret = bpf_loop(MAX_MATCH_SET_LEN, route_loop_cb, &ctx, 0);
-	if (unlikely(ret < 0)) {
-		params->decision.error = true;
-		return;
-	}
-	if (!params->decision.error)
-		return;
+	if (unlikely(ret < 0))
+		return ret;
+	if (ctx.result >= 0)
+		return ctx.result;
 	bpf_printk(
 		"No match_set hits. Did coder forget to sync common/consts/ebpf.go with enum MatchType?");
-	return;
+	return -EPERM;
 #undef _l4proto_type
 #undef _ipversion_type
 #undef _pname
@@ -1159,22 +1156,18 @@ new_connection:;
 			  (ethh.h_source[4] << 8) | (ethh.h_source[5]));
 	params.saddr = tuples.five.sip.u6_addr32;
 	params.daddr = tuples.five.dip.u6_addr32;
+	__s64 s64_ret;
 
-	route(&params);
-	if (params.decision.error) {
-		bpf_printk("shot routing: outbound=%u, mark=%u, must=%u, error=%d",
-			   params.decision.outbound,
-			   params.decision.mark,
-			   params.decision.must,
-			   params.decision.error);
+	s64_ret = route(&params);
+	if (s64_ret < 0) {
+		bpf_printk("shot routing: %d", s64_ret);
 		return TC_ACT_SHOT;
 	}
+	struct routing_result routing_result = { 0 };
 
-	struct routing_result routing_result = {};
-
-	routing_result.outbound = params.decision.outbound;
-	routing_result.mark = params.decision.mark;
-	routing_result.must = params.decision.must;
+	routing_result.outbound = s64_ret;
+	routing_result.mark = s64_ret >> 8;
+	routing_result.must = (s64_ret >> 40) & 1;
 	routing_result.dscp = tuples.dscp;
 	__builtin_memcpy(routing_result.mac, ethh.h_source,
 			 sizeof(routing_result.mac));
@@ -1430,20 +1423,17 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 						  (ethh.h_source[5]));
 			params.saddr = tuples.five.sip.u6_addr32;
 			params.daddr = tuples.five.dip.u6_addr32;
+			__s64 s64_ret;
 
-			route(&params);
-			if (params.decision.error) {
-				bpf_printk("shot routing: outbound=%u, mark=%u, must=%u, error=%d",
-					   params.decision.outbound,
-					   params.decision.mark,
-					   params.decision.must,
-					   params.decision.error);
+			s64_ret = route(&params);
+			if (s64_ret < 0) {
+				bpf_printk("shot routing: %d", s64_ret);
 				return TC_ACT_SHOT;
 			}
 
-			outbound = params.decision.outbound;
-			mark = params.decision.mark;
-			must = params.decision.must;
+			outbound = s64_ret & 0xff;
+			mark = s64_ret >> 8;
+			must = (s64_ret >> 40) & 1;
 
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 			// Print only new connection.
@@ -1507,22 +1497,26 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 		}
 
 		if (unlikely(tcp_state_syn)) {
-			struct routing_result routing_result = {};
+			// Only save non-direct routing to avoid conflicts with LAN ingress.
+			// Direct traffic doesn't need control plane processing.
+			if (outbound != OUTBOUND_DIRECT || mark != 0 || must) {
+				struct routing_result routing_result = {};
 
-			routing_result.outbound = outbound;
-			routing_result.mark = mark;
-			routing_result.must = must;
-			routing_result.dscp = tuples.dscp;
-			__builtin_memcpy(routing_result.mac, ethh.h_source,
-					 sizeof(ethh.h_source));
-			if (pid_pname) {
-				__builtin_memcpy(routing_result.pname,
-						 pid_pname->pname,
-						 TASK_COMM_LEN);
-				routing_result.pid = pid_pname->pid;
+				routing_result.outbound = outbound;
+				routing_result.mark = mark;
+				routing_result.must = must;
+				routing_result.dscp = tuples.dscp;
+				__builtin_memcpy(routing_result.mac, ethh.h_source,
+						 sizeof(ethh.h_source));
+				if (pid_pname) {
+					__builtin_memcpy(routing_result.pname,
+							 pid_pname->pname,
+							 TASK_COMM_LEN);
+					routing_result.pid = pid_pname->pid;
+				}
+				bpf_map_update_elem(&routing_tuples_map, &tuples.five,
+						    &routing_result, BPF_ANY);
 			}
-			bpf_map_update_elem(&routing_tuples_map, &tuples.five,
-					    &routing_result, BPF_ANY);
 		}
 
 	} else if (l4proto == IPPROTO_UDP) {
@@ -1569,31 +1563,38 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 		params.saddr = tuples.five.sip.u6_addr32;
 		params.daddr = tuples.five.dip.u6_addr32;
 
-		route(&params);
-		if (params.decision.error) {
-			bpf_printk("shot routing: outbound=%u, mark=%u, must=%u, error=%d",
-				   params.decision.outbound,
-				   params.decision.mark,
-				   params.decision.must,
-				   params.decision.error);
+		__s64 s64_ret;
+
+		s64_ret = route(&params);
+		if (s64_ret < 0) {
+			bpf_printk("shot routing: %d", s64_ret);
 			return TC_ACT_SHOT;
 		}
+		// Extract routing values.
+		__u8 outbound = s64_ret & 0xff;
+		__u32 mark = s64_ret >> 8;
+		bool must = (s64_ret >> 40) & 1;
 
-		struct routing_result routing_result = {};
+		// Only save non-direct routing to avoid conflicts with LAN ingress.
+		// Direct traffic doesn't need control plane processing.
+		if (outbound != OUTBOUND_DIRECT || mark != 0 || must) {
+			// Construct new hdr to encap.
+			struct routing_result routing_result = {};
 
-		routing_result.outbound = params.decision.outbound;
-		routing_result.mark = params.decision.mark;
-		routing_result.must = params.decision.must;
-		routing_result.dscp = tuples.dscp;
-		__builtin_memcpy(routing_result.mac, ethh.h_source,
-				 sizeof(ethh.h_source));
-		if (pid_pname) {
-			__builtin_memcpy(routing_result.pname, pid_pname->pname,
-					 TASK_COMM_LEN);
-			routing_result.pid = pid_pname->pid;
+			routing_result.outbound = outbound;
+			routing_result.mark = mark;
+			routing_result.must = must;
+			routing_result.dscp = tuples.dscp;
+			__builtin_memcpy(routing_result.mac, ethh.h_source,
+					 sizeof(ethh.h_source));
+			if (pid_pname) {
+				__builtin_memcpy(routing_result.pname, pid_pname->pname,
+						 TASK_COMM_LEN);
+				routing_result.pid = pid_pname->pid;
+			}
+			bpf_map_update_elem(&routing_tuples_map, &tuples.five,
+					    &routing_result, BPF_ANY);
 		}
-		bpf_map_update_elem(&routing_tuples_map, &tuples.five,
-				    &routing_result, BPF_ANY);
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 		__u32 pid = pid_pname ? pid_pname->pid : 0;
 
@@ -1601,17 +1602,17 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 			   tuples.five.sip.u6_addr32,
 			   bpf_ntohs(tuples.five.sport), pid);
 		bpf_printk("udp(wan): outbound: %u, %pI6:%u",
-			   routing_result.outbound, tuples.five.dip.u6_addr32,
+			   outbound, tuples.five.dip.u6_addr32,
 			   bpf_ntohs(tuples.five.dport));
 #endif
 
-		if (routing_result.outbound == OUTBOUND_DIRECT &&
-		    routing_result.mark == 0
+		if (outbound == OUTBOUND_DIRECT &&
+		    mark == 0
 		    // If mark is not zero, we should re-route it, so we send it to control
 		    // plane in WAN.
 		) {
 			return TC_ACT_OK;
-		} else if (unlikely(routing_result.outbound ==
+		} else if (unlikely(outbound ==
 				    OUTBOUND_BLOCK)) {
 			return TC_ACT_SHOT;
 		}
@@ -1621,7 +1622,7 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 		// Check outbound connectivity in specific ipversion and l4proto.
 		struct outbound_connectivity_query q = { 0 };
 
-		q.outbound = routing_result.outbound;
+		q.outbound = outbound;
 		q.ipversion = skb->protocol == bpf_htons(ETH_P_IP) ? 4 : 6;
 		q.l4proto = l4proto;
 		__u32 *alive;
@@ -1795,8 +1796,7 @@ static __always_inline int get_pid_pname(struct pid_pname *pid_pname)
 	return 0;
 }
 
-static __always_inline int _update_map_elem_by_cookie(const __u64 cookie,
-						      struct pid_pname *val)
+static __always_inline int _update_map_elem_by_cookie(const __u64 cookie)
 {
 	if (unlikely(!cookie)) {
 		bpf_printk("zero cookie");
@@ -1808,17 +1808,20 @@ static __always_inline int _update_map_elem_by_cookie(const __u64 cookie,
 	}
 
 	int ret;
+	// Build value.
+	struct pid_pname val = { 0 };
 
-	ret = get_pid_pname(val);
+	ret = get_pid_pname(&val);
 	if (ret)
 		return ret;
 
 	// Update map.
-	ret = bpf_map_update_elem(&cookie_pid_map, &cookie, val, BPF_ANY);
+	ret = bpf_map_update_elem(&cookie_pid_map, &cookie, &val, BPF_ANY);
 	if (unlikely(ret)) {
 		// bpf_printk("setup_mapping_from_sk: failed update map: %d", ret);
 		return ret;
 	}
+	bpf_map_update_elem(&tgid_pname_map, &val.pid, &val.pname, BPF_ANY);
 
 #ifdef __PRINT_SETUP_PROCESS_CONNNECTION
 	bpf_printk("setup_mapping: %llu -> %s (%d)", cookie, val.pname,
@@ -1830,12 +1833,22 @@ static __always_inline int _update_map_elem_by_cookie(const __u64 cookie,
 static __always_inline int update_map_elem_by_cookie(const __u64 cookie)
 {
 	int ret;
-	struct pid_pname val = {};
 
-	ret = _update_map_elem_by_cookie(cookie, &val);
+	ret = _update_map_elem_by_cookie(cookie);
 	if (ret) {
 		// Fallback to only write pid to avoid loop due to packets sent by dae.
+		struct pid_pname val = { 0 };
+
 		val.pid = bpf_get_current_pid_tgid() >> 32;
+		__u32(*pname)[TASK_COMM_LEN] =
+			bpf_map_lookup_elem(&tgid_pname_map, &val.pid);
+		if (pname) {
+			__builtin_memcpy(val.pname, *pname, TASK_COMM_LEN);
+			ret = 0;
+			bpf_printk("fallback [retrieve pname]: %u", val.pid);
+		} else {
+			bpf_printk("failed [retrieve pname]: %u", val.pid);
+		}
 		bpf_map_update_elem(&cookie_pid_map, &cookie, &val, BPF_ANY);
 		return ret;
 	}
