@@ -1,14 +1,28 @@
 name: BPF Test
 
+# 修改触发机制
 on:
-  pull_request:
-    paths:
-      - "**/*.c"
-      - "**/*.h"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/bpf-test.yml"
+  # 允许在 GitHub Actions 界面手动触发
+  workflow_dispatch:
+    inputs:
+      logLevel:
+        description: 'Log level'
+        required: false
+        default: 'warning'
+      tags:
+        description: 'Test scenario tags'
+        required: false
 
+# 如果您希望保留原有的 PR 自动触发，可以共存；
+  # 如果只需手动，请删除或注释掉下方的 pull_request 部分。
+  # pull_request:
+  #   paths:
+  #     - "**/*.c"
+  #     - "**/*.h"
+  #     - "go.mod"
+  #     - "go.sum"
+  #     - ".github/workflows/bpf-test.yml"
+  
 permissions: read-all
 
 jobs:
@@ -19,15 +33,15 @@ jobs:
     strategy:
       matrix:
         env:
-        - VERSION: 15
-        - VERSION: 16
-        - VERSION: 17
-        - VERSION: 18
-        - VERSION: 19
+          - VERSION: 15
+          - VERSION: 16
+          - VERSION: 17
+          - VERSION: 18
+          - VERSION: 19
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+        uses: actions/checkout@eef6142e89ff4e94d5d8c9a3f92f559530d93901 # v4.2.1
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -38,9 +52,19 @@ jobs:
           sudo apt-get update -y
           sudo apt-get install -y clang-$VERSION llvm-$VERSION
 
-      - name: Run BPF tests
+      - name: Run BPF tests and Redirect Logs
         env: ${{ matrix.env }}
+        # 使用 tee 同时输出到控制台和文件，方便后续上传
         run: |
           git submodule update --init
-          sudo CLANG=clang-$VERSION make ebpf-test || (echo "Run 'make ebpf-test' locally to investigate failures"; exit 1)
+          sudo CLANG=clang-$VERSION make ebpf-test 2>&1 | tee bpf-test-clang-$VERSION.log || \
+          (echo "Run 'make ebpf-test' locally to investigate failures"; exit 1)
 
+      - name: Upload Test Logs
+        # 使用 always() 确保即使测试失败也会上传日志
+        if: always()
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea23f80581c11094042456450 # v4.4.3
+        with:
+          name: bpf-test-logs-clang-${{ matrix.VERSION }}
+          path: bpf-test-clang-${{ matrix.VERSION }}.log
+          retention-days: 7 # 设置保留天数，节省仓库空间
