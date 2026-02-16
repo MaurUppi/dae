@@ -30,8 +30,9 @@ import (
 )
 
 const (
-	MaxDnsLookupDepth  = 3
-	minFirefoxCacheTtl = 120
+	MaxDnsLookupDepth        = 3
+	minFirefoxCacheTtl       = 120
+	maxDnsForwarderCacheSize = 128
 )
 
 type IpVersionPrefer int
@@ -82,6 +83,7 @@ type DnsController struct {
 	dnsCache            map[string]*DnsCache
 	dnsForwarderCacheMu sync.Mutex
 	dnsForwarderCache   map[dnsForwarderKey]DnsForwarder
+	dnsForwarderLastUse map[dnsForwarderKey]time.Time
 }
 
 type handlingState struct {
@@ -125,7 +127,34 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		dnsCache:            make(map[string]*DnsCache),
 		dnsForwarderCacheMu: sync.Mutex{},
 		dnsForwarderCache:   make(map[dnsForwarderKey]DnsForwarder),
+		dnsForwarderLastUse: make(map[dnsForwarderKey]time.Time),
 	}, nil
+}
+
+func (c *DnsController) evictDnsForwarderCacheOneLocked() {
+	if len(c.dnsForwarderCache) < maxDnsForwarderCacheSize {
+		return
+	}
+	var (
+		oldestKey   dnsForwarderKey
+		oldestTime  time.Time
+		initialized bool
+	)
+	for key, lastUse := range c.dnsForwarderLastUse {
+		if !initialized || lastUse.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = lastUse
+			initialized = true
+		}
+	}
+	if !initialized {
+		return
+	}
+	if forwarder, ok := c.dnsForwarderCache[oldestKey]; ok {
+		_ = forwarder.Close()
+		delete(c.dnsForwarderCache, oldestKey)
+	}
+	delete(c.dnsForwarderLastUse, oldestKey)
 }
 
 func (c *DnsController) cacheKey(qname string, qtype uint16) string {
@@ -582,16 +611,19 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 	defer cancel()
 
 	// get forwarder from cache
+	cacheKeyForwarder := dnsForwarderKey{upstream: upstream.String(), dialArgument: *dialArgument}
 	c.dnsForwarderCacheMu.Lock()
-	forwarder, ok := c.dnsForwarderCache[dnsForwarderKey{upstream: upstream.String(), dialArgument: *dialArgument}]
+	forwarder, ok := c.dnsForwarderCache[cacheKeyForwarder]
 	if !ok {
+		c.evictDnsForwarderCacheOneLocked()
 		forwarder, err = newDnsForwarder(upstream, *dialArgument)
 		if err != nil {
 			c.dnsForwarderCacheMu.Unlock()
 			return err
 		}
-		c.dnsForwarderCache[dnsForwarderKey{upstream: upstream.String(), dialArgument: *dialArgument}] = forwarder
+		c.dnsForwarderCache[cacheKeyForwarder] = forwarder
 	}
+	c.dnsForwarderLastUse[cacheKeyForwarder] = time.Now()
 	c.dnsForwarderCacheMu.Unlock()
 
 	defer func() {

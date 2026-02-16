@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strconv"
 	"testing"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/dns"
+	dnsmessage "github.com/miekg/dns"
 )
 
 type timeoutNetErr struct{}
@@ -98,3 +100,27 @@ func TestIsTimeoutErrorWrappedDeadline(t *testing.T) {
 		t.Fatal("expected wrapped deadline to be detected as timeout")
 	}
 }
+
+func TestEvictDnsForwarderCacheOneLocked(t *testing.T) {
+	c := &DnsController{
+		dnsForwarderCache:   make(map[dnsForwarderKey]DnsForwarder),
+		dnsForwarderLastUse: make(map[dnsForwarderKey]time.Time),
+	}
+	for i := 0; i < maxDnsForwarderCacheSize; i++ {
+		key := dnsForwarderKey{upstream: "u" + strconv.Itoa(i), dialArgument: dialArgument{l4proto: consts.L4ProtoStr_UDP}}
+		c.dnsForwarderCache[key] = fakeDnsForwarder{}
+		c.dnsForwarderLastUse[key] = time.Unix(int64(i), 0)
+	}
+	c.evictDnsForwarderCacheOneLocked()
+	if len(c.dnsForwarderCache) != maxDnsForwarderCacheSize-1 {
+		t.Fatalf("cache size = %d, want %d", len(c.dnsForwarderCache), maxDnsForwarderCacheSize-1)
+	}
+	if len(c.dnsForwarderLastUse) != maxDnsForwarderCacheSize-1 {
+		t.Fatalf("lastUse size = %d, want %d", len(c.dnsForwarderLastUse), maxDnsForwarderCacheSize-1)
+	}
+}
+
+type fakeDnsForwarder struct{}
+
+func (fakeDnsForwarder) ForwardDNS(context.Context, []byte) (*dnsmessage.Msg, error) { return nil, nil }
+func (fakeDnsForwarder) Close() error                                                { return nil }
