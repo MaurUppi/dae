@@ -100,3 +100,22 @@
 - 命令：`go test -race ./control/...`
 - 结果：失败，除上述依赖拉取 403 外，`control/kern/tests` 还出现 `bpftestObjects/loadBpftestObjects` 未定义构建错误。
 - 结论：受环境限制，未能在本地完成 race 回归；已在 CI 增加对应检测工作流。
+
+## CI Failure Investigation - dns-race.yml 构建失败
+- CI Run: https://github.com/MaurUppi/dae/actions/runs/22063263964/job/63748548361
+- 失败原因：`control` 包依赖 BPF 代码生成（`bpfObjects`, `bpfRoutingResult` 等类型），但 dns-race.yml 缺少必要的构建步骤。
+- 诊断命令：`GOWORK=off GOOS=linux GOARCH=amd64 go build -o /dev/null ./control`
+- 诊断结果：
+  ```
+  control/control_plane_core.go:39:19: undefined: bpfObjects
+  control/dns_control.go:372:17: undefined: bpfRoutingResult
+  control/routing_matcher_userspace.go:23:12: undefined: bpfMatchSet
+  ```
+- 根因：BPF 类型由 `make` 过程通过 `cilium/ebpf` 的 `bpf2go` 工具生成，需要 `clang-15` 和 `llvm-15`。
+- 修复：参考 `seed-build.yml`，在 dns-race.yml 中增加：
+  1. `git submodule update` — 初始化子模块
+  2. `apt-get install clang-15 llvm-15` — 安装 BPF 编译工具链
+  3. `go mod download` — 下载依赖
+  4. `export CLANG=clang-15 && make APPNAME=dae dae` — 生成 BPF 代码
+- 修复后命令：`go test -race -v ./control/...`
+- 结论：已更新 `.github/workflows/dns-race.yml`，待推送后在 CI 验证。详见 `.plan/ci_failure_analysis.md`。
