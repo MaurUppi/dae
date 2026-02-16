@@ -1,7 +1,7 @@
 /*
 *  SPDX-License-Identifier: AGPL-3.0-only
 *  Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
-*/
+ */
 
 package control
 
@@ -80,11 +80,11 @@ func (d *DoH) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 	if d.client == nil {
 		d.client = d.getClient()
 	}
-	msg, err := sendHttpDNS(d.client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
+	msg, err := sendHttpDNS(ctx, d.client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
 	if err != nil {
 		// If failed to send DNS request, we should try to create a new client.
 		d.client = d.getClient()
-		msg, err = sendHttpDNS(d.client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
+		msg, err = sendHttpDNS(ctx, d.client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
 		if err != nil {
 			return nil, err
 		}
@@ -196,7 +196,7 @@ func (d *DoQ) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 	// thanks https://github.com/natesales/q/blob/1cb2639caf69bd0a9b46494a3c689130df8fb24a/transport/quic.go#L97
 	binary.BigEndian.PutUint16(data[0:2], 0)
 
-	msg, err := sendStreamDNS(stream, data)
+	msg, err := sendStreamDNS(ctx, stream, data)
 	if err != nil {
 		return nil, err
 	}
@@ -259,7 +259,7 @@ func (d *DoTLS) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 	}
 	d.conn = tlsConn
 
-	return sendStreamDNS(tlsConn, data)
+	return sendStreamDNS(ctx, tlsConn, data)
 }
 
 func (d *DoTLS) Close() error {
@@ -287,7 +287,7 @@ func (d *DoTCP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 	}
 
 	d.conn = conn
-	return sendStreamDNS(conn, data)
+	return sendStreamDNS(ctx, conn, data)
 }
 
 func (d *DoTCP) Close() error {
@@ -313,6 +313,7 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 	if err != nil {
 		return nil, err
 	}
+	d.conn = conn
 
 	timeout := 5 * time.Second
 	_ = conn.SetDeadline(time.Now().Add(timeout))
@@ -362,12 +363,14 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 
 func (d *DoUDP) Close() error {
 	if d.conn != nil {
-		return d.conn.Close()
+		err := d.conn.Close()
+		d.conn = nil
+		return err
 	}
 	return nil
 }
 
-func sendHttpDNS(client *http.Client, target string, upstream *dns.Upstream, data []byte) (respMsg *dnsmessage.Msg, err error) {
+func sendHttpDNS(ctx context.Context, client *http.Client, target string, upstream *dns.Upstream, data []byte) (respMsg *dnsmessage.Msg, err error) {
 	// disable redirect https://github.com/daeuniverse/dae/pull/649#issuecomment-2379577896
 	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 		return fmt.Errorf("do not use a server that will redirect, upstream: %v", upstream.String())
@@ -384,7 +387,7 @@ func sendHttpDNS(client *http.Client, target string, upstream *dns.Upstream, dat
 	q.Set("dns", base64.RawURLEncoding.EncodeToString(data))
 	serverURL.RawQuery = q.Encode()
 
-	req, err := http.NewRequest(http.MethodGet, serverURL.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, serverURL.String(), nil)
 	if err != nil {
 		return nil, err
 	}
@@ -406,7 +409,19 @@ func sendHttpDNS(client *http.Client, target string, upstream *dns.Upstream, dat
 	return &msg, nil
 }
 
-func sendStreamDNS(stream io.ReadWriter, data []byte) (respMsg *dnsmessage.Msg, err error) {
+func sendStreamDNS(ctx context.Context, stream io.ReadWriter, data []byte) (respMsg *dnsmessage.Msg, err error) {
+	type streamDeadliner interface {
+		SetDeadline(t time.Time) error
+	}
+	if deadliner, ok := stream.(streamDeadliner); ok {
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = deadliner.SetDeadline(deadline)
+		}
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
+
 	// We should write two byte length in the front of stream DNS request.
 	bReq := pool.Get(2 + len(data))
 	defer pool.Put(bReq)
@@ -416,10 +431,16 @@ func sendStreamDNS(stream io.ReadWriter, data []byte) (respMsg *dnsmessage.Msg, 
 	if err != nil {
 		return nil, fmt.Errorf("failed to write DNS req: %w", err)
 	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
+	}
 
 	// Read two byte length.
 	if _, err = io.ReadFull(stream, bReq[:2]); err != nil {
 		return nil, fmt.Errorf("failed to read DNS resp payload length: %w", err)
+	}
+	if err = ctx.Err(); err != nil {
+		return nil, err
 	}
 	respLen := int(binary.BigEndian.Uint16(bReq))
 	// Try to reuse the buf.
