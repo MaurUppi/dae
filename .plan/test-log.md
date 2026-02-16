@@ -67,3 +67,36 @@
 - 命令：`go test ./control -run 'Test(IsTimeoutError|TcpFallbackDialArgument|SendStreamDNSRespectsContextCancelBeforeIO|EvictDnsForwarderCacheOneLocked)' -count=1`
 - 结果：失败（环境限制），`proxy.golang.org` 拉取私有/受限依赖 `github.com/daeuniverse/outbound` 返回 403 Forbidden。
 - 结论：在当前环境无法完成自动化回归编译；已保留任务级静态校验记录。
+
+## Code Audit Iteration - T1（移除 dead code）
+- 命令：`sed -n '626,650p' control/dns_control.go`
+- 结果：`forwarder.ForwardDNS(ctxDial, data)` 前不再存在 `if err != nil { return err }` 的残留分支。
+- 结论：通过（dead code 已移除）。
+
+## Code Audit Iteration - T2（DoUDP 并发竞争修复）
+- 命令：`sed -n '312,360p' control/dns.go`
+- 结果：`DoUDP.ForwardDNS` 新增 `localConn := conn`，goroutine 写入与主流程读取均使用 `localConn`，重试等待改为 `retryTicker`。
+- 结论：通过（避免 goroutine 与后续调用共享可变 `d.conn`）。
+
+## Code Audit Iteration - T3（fallback 错误语义修复）
+- 命令：`rg -n "tcp fallback forwarder creation failed" control/dns_control.go`
+- 结果：命中 `return fmt.Errorf("tcp fallback forwarder creation failed: %w (original: %v)", fallbackErr, err)`。
+- 结论：通过（fallback 创建失败不再误报为原始 UDP 错误）。
+
+## Code Audit Iteration - T4（dialSend context 传播）
+- 命令：`rg -n "dialSend\(context.Background\(|func \(c \*DnsController\) dialSend\(ctx context.Context|context.WithTimeout\(ctx, consts.DefaultDialTimeout\)|dialSend\(ctx, invokingDepth\+1" control/dns_control.go`
+- 结果：命中入口传入 `context.Background()`、`dialSend(ctx ...)` 签名、`WithTimeout(ctx, ...)`、递归透传 `ctx`。
+- 结论：通过（已去除 `context.TODO()`）。
+
+## Code Audit Iteration - T5（CI race detector）
+- 命令：`rg -n "go test -race ./control/..." .github/workflows/dns-race.yml`
+- 结果：命中新增工作流中的 race 检测命令。
+- 结论：通过（CI 已补充 race 检测入口）。
+
+## Code Audit Iteration - 里程碑回归
+- 命令：`go test ./control -run 'Test(IsTimeoutError|TcpFallbackDialArgument|SendStreamDNSRespectsContextCancelBeforeIO|EvictDnsForwarderCacheOneLocked)' -count=1`
+- 结果：失败，依赖 `github.com/daeuniverse/outbound` 从 `proxy.golang.org` 拉取返回 403 Forbidden。
+- 结论：受环境限制，无法完成自动化回归编译。
+- 命令：`go test -race ./control/...`
+- 结果：失败，除上述依赖拉取 403 外，`control/kern/tests` 还出现 `bpftestObjects/loadBpftestObjects` 未定义构建错误。
+- 结论：受环境限制，未能在本地完成 race 回归；已在 CI 增加对应检测工作流。
