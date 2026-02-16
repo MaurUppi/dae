@@ -316,14 +316,14 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 	d.conn = conn
 
 	timeout := 5 * time.Second
-	_ = conn.SetDeadline(time.Now().Add(timeout))
-	dnsReqCtx, cancelDnsReqCtx := context.WithTimeout(context.TODO(), timeout)
+	_ = d.conn.SetDeadline(time.Now().Add(timeout))
+	dnsReqCtx, cancelDnsReqCtx := context.WithTimeout(ctx, timeout)
 	defer cancelDnsReqCtx()
 
 	go func() {
 		// Send DNS request every seconds.
 		for {
-			_, _ = conn.Write(data)
+			_, _ = d.conn.Write(data)
 			// if err != nil {
 			// 	if c.log.IsLevelEnabled(logrus.DebugLevel) {
 			// 		c.log.WithFields(logrus.Fields{
@@ -350,7 +350,7 @@ func (d *DoUDP) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, e
 	respBuf := pool.GetFullCap(consts.EthernetMtu)
 	defer pool.Put(respBuf)
 	// Wait for response.
-	n, err := conn.Read(respBuf)
+	n, err := d.conn.Read(respBuf)
 	if err != nil {
 		return nil, err
 	}
