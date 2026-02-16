@@ -233,27 +233,17 @@ UDP 重试间隔固定为 1 秒，超时固定为 5 秒（L318）。在低延迟
 
 ## Removal/Iteration Plan
 
-### 可立即删除
+I found **11 issues** (P0: **1**, P1: **3**, P2: **5**, P3: **2**).
+
+### 1. 可立即删除
 - `control/dns_control.go:635-637`: dead code（`if err != nil { return err }`），`err` 在此处一定为 nil。
 
-### 后续迭代建议
+## 2. Action now
+0. MUST-FIX **Fix P0 + P1** — 修复并发竞争 + dead code + fallback 错误返回
+1. **Go race detector 验证**: 在 CI 中增加 `go test -race ./control/...` 以检测 P0-1 所述的数据竞争。
+
+### 2. 后续迭代建议
 1. **DoUDP 并发安全修复** (P0-1): 优先修复 goroutine 与 `d.conn` 的竞争问题。
 2. **dialSend context 传播** (P1-3): 将 `context.TODO()` 替换为调用链 context。
 3. **forwarder 连接池化** (P2-1): 如果需要真正的连接复用，需重新设计 forwarder 生命周期。
 4. **测试补充** (P2-5): 补充连接生命周期和集成测试。
-
----
-
-## Additional Suggestions
-
-1. **Go race detector 验证**: 建议在 CI 中增加 `go test -race ./control/...` 以检测 P0-1 所述的数据竞争。
-2. **forwarder cache 指标**: 建议添加 cache hit/miss 计数器，以便观测 cache 效率。
-3. **UDP 重发流量放大**: 如 v3 计划所述，DoUDP 每次查询最多发送 5 个 UDP 包（每秒重发，共 5 秒）。压测下这会放大上游流量 5 倍。可考虑减少重试次数或缩短超时。
-
----
-
-## Next Steps
-
-I found **11 issues** (P0: **1**, P1: **3**, P2: **5**, P3: **2**).
-
-MUST-FIX **Fix P0 + P1** — 修复并发竞争 + dead code + fallback 错误返回
