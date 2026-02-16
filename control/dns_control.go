@@ -7,6 +7,7 @@ package control
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math"
 	"net"
@@ -387,7 +388,7 @@ func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (er
 		return c.handle_(dnsMessage, req, true)
 	}
 
-	// Try to make both A and AAAA lookups.
+	// Query preferred qtype first, and only fallback to the opposite qtype when needed.
 	dnsMessage2 := deepcopy.Copy(dnsMessage).(*dnsmessage.Msg)
 	dnsMessage2.Id = uint16(fastrand.Intn(math.MaxUint16))
 	var qtype2 uint16
@@ -401,13 +402,7 @@ func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (er
 	}
 	dnsMessage2.Question[0].Qtype = qtype2
 
-	done := make(chan struct{})
-	go func() {
-		_ = c.handle_(dnsMessage2, req, false)
-		done <- struct{}{}
-	}()
 	err = c.handle_(dnsMessage, req, false)
-	<-done
 	if err != nil {
 		return err
 	}
@@ -422,12 +417,21 @@ func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (er
 		return c.sendReject_(dnsMessage, req)
 	}
 	// resp is valid.
-	cache2 := c.LookupDnsRespCache(c.cacheKey(qname, qtype2), true)
-	if c.qtypePrefer == qtype || cache2 == nil || !cache2.IncludeAnyIp() {
+	if c.qtypePrefer == qtype {
 		return sendPkt(c.log, resp, req.realDst, req.realSrc, req.src, req.lConn)
-	} else {
+	}
+
+	cache2 := c.LookupDnsRespCache(c.cacheKey(qname, qtype2), true)
+	if cache2 == nil || !cache2.IncludeAnyIp() {
+		if err = c.handle_(dnsMessage2, req, false); err != nil {
+			return err
+		}
+		cache2 = c.LookupDnsRespCache(c.cacheKey(qname, qtype2), true)
+	}
+	if cache2 != nil && cache2.IncludeAnyIp() {
 		return c.sendReject_(dnsMessage, req)
 	}
+	return sendPkt(c.log, resp, req.realDst, req.realSrc, req.src, req.lConn)
 }
 
 func (c *DnsController) handle_(
@@ -602,6 +606,31 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 
 	respMsg, err = forwarder.ForwardDNS(ctxDial, data)
 	if err != nil {
+		if c.timeoutExceedCallback != nil && isTimeoutError(err) {
+			c.timeoutExceedCallback(dialArgument, err)
+		}
+		if fallbackDialArgument := tcpFallbackDialArgument(upstream, dialArgument, err); fallbackDialArgument != nil {
+			fallbackForwarder, fallbackErr := newDnsForwarder(upstream, *fallbackDialArgument)
+			if fallbackErr != nil {
+				return err
+			}
+			defer fallbackForwarder.Close()
+			respMsg, fallbackErr = fallbackForwarder.ForwardDNS(ctxDial, data)
+			if fallbackErr == nil {
+				dialArgument = fallbackDialArgument
+				err = nil
+			} else {
+				if c.timeoutExceedCallback != nil && isTimeoutError(fallbackErr) {
+					c.timeoutExceedCallback(fallbackDialArgument, fallbackErr)
+				}
+				return fallbackErr
+			}
+		} else {
+			return err
+		}
+	}
+
+	if err != nil {
 		return err
 	}
 
@@ -690,4 +719,33 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 		}
 	}
 	return nil
+}
+
+func isTimeoutError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout()
+	}
+	return false
+}
+
+func tcpFallbackDialArgument(upstream *dns.Upstream, dialArgument *dialArgument, err error) *dialArgument {
+	if upstream == nil || upstream.Scheme != dns.UpstreamScheme_TCP_UDP {
+		return nil
+	}
+	if dialArgument == nil || dialArgument.l4proto != consts.L4ProtoStr_UDP {
+		return nil
+	}
+	if !isTimeoutError(err) {
+		return nil
+	}
+	fallback := *dialArgument
+	fallback.l4proto = consts.L4ProtoStr_TCP
+	return &fallback
 }
