@@ -536,7 +536,7 @@ func (c *DnsController) handle_(
 	if err != nil {
 		return fmt.Errorf("pack DNS packet: %w", err)
 	}
-	return c.dialSend(0, req, data, dnsMessage.Id, upstream, needResp)
+	return c.dialSend(context.Background(), 0, req, data, dnsMessage.Id, upstream, needResp)
 }
 
 // sendReject_ send empty answer.
@@ -562,7 +562,7 @@ func (c *DnsController) sendReject_(dnsMessage *dnsmessage.Msg, req *udpRequest)
 	return nil
 }
 
-func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte, id uint16, upstream *dns.Upstream, needResp bool) (err error) {
+func (c *DnsController) dialSend(ctx context.Context, invokingDepth int, req *udpRequest, data []byte, id uint16, upstream *dns.Upstream, needResp bool) (err error) {
 	if invokingDepth >= MaxDnsLookupDepth {
 		return fmt.Errorf("too deep DNS lookup invoking (depth: %v); there may be infinite loop in your DNS response routing", MaxDnsLookupDepth)
 	}
@@ -607,7 +607,7 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 	// We should set a connClosed flag to avoid it.
 	var connClosed bool
 
-	ctxDial, cancel := context.WithTimeout(context.TODO(), consts.DefaultDialTimeout)
+	ctxDial, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
 	defer cancel()
 
 	// get forwarder from cache
@@ -632,10 +632,6 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 		}
 	}()
 
-	if err != nil {
-		return err
-	}
-
 	respMsg, err = forwarder.ForwardDNS(ctxDial, data)
 	if err != nil {
 		if c.timeoutExceedCallback != nil && isTimeoutError(err) {
@@ -644,7 +640,7 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 		if fallbackDialArgument := tcpFallbackDialArgument(upstream, dialArgument, err); fallbackDialArgument != nil {
 			fallbackForwarder, fallbackErr := newDnsForwarder(upstream, *fallbackDialArgument)
 			if fallbackErr != nil {
-				return err
+				return fmt.Errorf("tcp fallback forwarder creation failed: %w (original: %v)", fallbackErr, err)
 			}
 			defer fallbackForwarder.Close()
 			respMsg, fallbackErr = fallbackForwarder.ForwardDNS(ctxDial, data)
@@ -702,7 +698,7 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 				"next_upstream": nextUpstream.String(),
 			}).Traceln("Change DNS upstream and resend")
 		}
-		return c.dialSend(invokingDepth+1, req, data, id, nextUpstream, needResp)
+		return c.dialSend(ctx, invokingDepth+1, req, data, id, nextUpstream, needResp)
 	}
 	if upstreamIndex.IsReserved() && c.log.IsLevelEnabled(logrus.InfoLevel) {
 		var (
