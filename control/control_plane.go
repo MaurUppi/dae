@@ -45,6 +45,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const (
+	// Cap async DNS handling to avoid unbounded goroutine growth under
+	// sustained high-rate DNS traffic.
+	maxAsyncDnsInFlight = 512
+)
+
 type ControlPlane struct {
 	log *logrus.Logger
 
@@ -58,6 +64,7 @@ type ControlPlane struct {
 
 	dnsController    *DnsController
 	onceNetworkReady sync.Once
+	dnsAsyncSem      chan struct{}
 
 	dialMode consts.DialMode
 
@@ -390,6 +397,7 @@ func NewControlPlane(
 		outbounds:         outbounds,
 		dnsController:     nil,
 		onceNetworkReady:  sync.Once{},
+		dnsAsyncSem:       make(chan struct{}, maxAsyncDnsInFlight),
 		dialMode:          dialMode,
 		routingMatcher:    routingMatcher,
 		ctx:               ctx,
@@ -833,20 +841,33 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				// DNS packets must not block the per-src serial task queue:
 				// a single slow upstream (up to DefaultDialTimeout=8s) would
 				// stall all subsequent packets from the same source IP.
-				// DNS is stateless; parallel handling is safe.
+				// DNS is stateless; parallel handling is safe.  Use a bounded
+				// semaphore to avoid unbounded goroutine growth.
 				if pktDst.Port() == 53 || pktDst.Port() == 5353 {
-					// Transfer buffer ownership to the goroutine; clear defers.
-					gData := data
-					gOob := oob
-					data = nil
-					oob = nil
-					go func() {
-						defer gData.Put()
-						defer gOob.Put()
-						if e := c.handlePkt(udpConn, gData, convergeSrc, common.ConvergeAddrPort(pktDst), common.ConvergeAddrPort(realDst), routingResult, false); e != nil {
+					select {
+					case c.dnsAsyncSem <- struct{}{}:
+						// Transfer buffer ownership to the goroutine; clear defers.
+						gData := data
+						gOob := oob
+						data = nil
+						oob = nil
+						go func() {
+							defer func() {
+								<-c.dnsAsyncSem
+							}()
+							defer gData.Put()
+							defer gOob.Put()
+							if e := c.handlePkt(udpConn, gData, convergeSrc, common.ConvergeAddrPort(pktDst), common.ConvergeAddrPort(realDst), routingResult, false); e != nil {
+								c.log.Warnln("handlePkt(dns):", e)
+							}
+						}()
+					default:
+						// Semaphore saturated: fall back to sync handling here to
+						// apply backpressure instead of spawning unbounded goroutines.
+						if e := c.handlePkt(udpConn, data, convergeSrc, common.ConvergeAddrPort(pktDst), common.ConvergeAddrPort(realDst), routingResult, false); e != nil {
 							c.log.Warnln("handlePkt(dns):", e)
 						}
-					}()
+					}
 					return
 				}
 				if e := c.handlePkt(udpConn, data, convergeSrc, common.ConvergeAddrPort(pktDst), common.ConvergeAddrPort(realDst), routingResult, false); e != nil {
