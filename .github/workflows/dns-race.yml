@@ -49,6 +49,5 @@ jobs:
       - name: Run race detector for control package
         # Exclude control/kern/tests: it requires a separate `go generate` step
         # (make ebpf-test) and needs kernel privileges to load BPF programs.
-        # TestPacketSniffer_Mismatched is a pre-existing flaky test unrelated to
-        # DNS changes; skip it here so it does not block race detection.
+        # It is covered by the dedicated bpf-test / kernel-test workflows.
         run: go test -race -v -run '.' $(go list ./control/... | grep -v 'control/kern/tests')
