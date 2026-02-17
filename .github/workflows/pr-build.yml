@@ -26,23 +26,31 @@ on:
 
 jobs:
   pre-actions:
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event.pull_request.draft == false && github.repository_owner == 'daeuniverse' }}
     uses: daeuniverse/ci-seed-jobs/.github/workflows/pre-actions.yml@master
     with:
       repository: ${{ github.repository }}
       ref: ${{ github.event.pull_request.head.sha }}
       fetch-depth: 0
-      check-runs: ${{ github.repository_owner == 'daeuniverse' && '["build", "pr-build-passed"]' || '[]' }}
+      check-runs: '["build", "pr-build-passed"]'
     secrets: inherit
 
   build:
     needs: [pre-actions]
-    if: ${{ github.event.pull_request.draft == false }}
+    if: ${{ github.event.pull_request.draft == false && github.repository_owner == 'daeuniverse' }}
     uses: daeuniverse/dae/.github/workflows/seed-build.yml@main
     with:
       ref: ${{ github.event.pull_request.head.sha }}
       pr-number: ${{ github.event.pull_request.number }}
-      build-type: ${{ github.repository_owner == 'daeuniverse' && 'pr-build' || 'main-build' }}
+      build-type: pr-build
+    secrets: inherit
+
+  build-fork:
+    if: ${{ github.event.pull_request.draft == false && github.repository_owner != 'daeuniverse' }}
+    uses: ./.github/workflows/seed-build.yml
+    with:
+      ref: ${{ github.event.pull_request.head.sha }}
+      build-type: main-build
     secrets: inherit
 
   post-actions:
