@@ -830,6 +830,25 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				} else {
 					realDst = pktDst
 				}
+				// DNS packets must not block the per-src serial task queue:
+				// a single slow upstream (up to DefaultDialTimeout=8s) would
+				// stall all subsequent packets from the same source IP.
+				// DNS is stateless; parallel handling is safe.
+				if pktDst.Port() == 53 || pktDst.Port() == 5353 {
+					// Transfer buffer ownership to the goroutine; clear defers.
+					gData := data
+					gOob := oob
+					data = nil
+					oob = nil
+					go func() {
+						defer gData.Put()
+						defer gOob.Put()
+						if e := c.handlePkt(udpConn, gData, convergeSrc, common.ConvergeAddrPort(pktDst), common.ConvergeAddrPort(realDst), routingResult, false); e != nil {
+							c.log.Warnln("handlePkt(dns):", e)
+						}
+					}()
+					return
+				}
 				if e := c.handlePkt(udpConn, data, convergeSrc, common.ConvergeAddrPort(pktDst), common.ConvergeAddrPort(realDst), routingResult, false); e != nil {
 					c.log.Warnln("handlePkt:", e)
 				}
