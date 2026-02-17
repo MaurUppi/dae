@@ -421,3 +421,102 @@ GOWORK=off GOOS=linux GOARCH=amd64 go test ./control -run 'TestHandle_Propagates
 - F1~F5 对应代码与测试修复已全部落地。
 - 本地环境无法完成 control 包完整构建回归（go.work 外部依赖 + Linux/BPF 约束）。
 - 最终验证需在 Linux CI（含 BPF 生成链路）完成。
+
+## dns-traceback-2nd-fix T9: F1/F3/F4/F2 串行修复与验证（High -> Medium）
+
+**日期**: 2026-02-17
+**来源**: `/Users/ouzy/Documents/DevProjects/dae/.plan/code_audit_trace-back-2nd.md`
+**执行文档**: `/Users/ouzy/Documents/DevProjects/dae/.plan/code_audit_trace-back-2nd-dev.md`
+
+### T1（HIGH: F1+F4）DNS 入队非阻塞 + queue/drop 计数器
+
+**变更文件**
+- `control/control_plane.go`
+- `control/dns_improvement_test.go`
+
+**测试命令与结果**
+```bash
+# 1) 格式化
+gofmt -w control/control_plane.go control/dns_improvement_test.go
+→ PASS
+
+# 2) 关键路径检查（计数器与非阻塞分支）
+rg -n "dnsIngressQueueLogEvery|onDnsIngressQueueFull|dns_ingress_queue_full_total|dns_ingress_drop_total" control/control_plane.go
+→ 命中常量、queue-full 处理函数与日志字段
+
+# 3) 测试语义检查（lane 满载应立即丢弃）
+rg -n "TestUdpIngressDispatch_NoSyncFallbackWhenDnsLaneBusy|dnsIngressQueueFullTotal|dnsIngressDropTotal" control/dns_improvement_test.go
+→ 命中新断言：queueFull/drop 计数器递增，且不回退 non-dns 路径
+```
+
+**结论**
+- PASS（本地代码级结构验证通过）
+
+### T2（HIGH: F3）关闭路径排空 DNS ingress queue
+
+**变更文件**
+- `control/control_plane.go`
+- `control/dns_improvement_test.go`
+
+**测试命令与结果**
+```bash
+# 1) 关键路径检查（退出 drain + 关闭期间不再处理）
+rg -n "drainDnsIngressQueue|ctx\.Err\(\)" control/control_plane.go
+→ 命中：worker 收到 ctx.Done 后排空队列；关闭期间任务直接回收
+
+# 2) 测试覆盖检查
+rg -n "TestDrainDnsIngressQueue_DrainsWithoutCountingDrop" control/dns_improvement_test.go
+→ 命中新增测试（验证 drain 后队列为空且不计入 queue-full drop）
+```
+
+**结论**
+- PASS（本地代码级结构验证通过）
+
+### M1（HIGH 里程碑回归）
+
+**目标**: 尝试本地编译测试；确认环境边界并转交 CI。
+
+**测试命令与结果**
+```bash
+# 1) 本机（darwin）
+GOWORK=off go test ./control -run 'Test(UdpIngressDispatch|DrainDnsIngressQueue|AnyfromPoolGetOrCreate_(ZeroTTLStillPooled|NegativeTTLStillPooled))' -count=1
+→ FAIL: 缺失 Linux netlink/IP_TRANSPARENT 常量（平台限制）
+
+# 2) Linux 目标编译（交叉）
+GOWORK=off GOOS=linux GOARCH=amd64 go test ./control -run 'Test(UdpIngressDispatch|DrainDnsIngressQueue|AnyfromPoolGetOrCreate_(ZeroTTLStillPooled|NegativeTTLStillPooled))' -count=1
+→ FAIL: 缺失 eBPF 生成类型（bpfObjects/bpfRoutingResult），需 CI 生成链路
+```
+
+**结论**
+- 本地无法完成 control 包编译回归（已复现并定位为环境限制）
+- High 里程碑通过“代码级验证”，编译测试转 CI
+
+### T3（MEDIUM: F2）AnyfromPool ttl<=0 入池语义修复
+
+**变更文件**
+- `control/anyfrom_pool.go`
+- `control/dns_improvement_test.go`
+
+**测试命令与结果**
+```bash
+# 1) 格式化
+gofmt -w control/anyfrom_pool.go control/dns_improvement_test.go
+→ PASS
+
+# 2) 关键实现检查
+rg -n "createAnyfromFn|p\.pool\[lAddr\] = newAf" control/anyfrom_pool.go
+→ 命中：新增 create seam；p.pool[lAddr] 无条件赋值
+
+# 3) 新增测试覆盖检查
+rg -n "TestAnyfromPoolGetOrCreate_ZeroTTLStillPooled|TestAnyfromPoolGetOrCreate_NegativeTTLStillPooled" control/dns_improvement_test.go
+→ 命中 2 个 ttl<=0 语义测试
+```
+
+**结论**
+- PASS（本地代码级结构验证通过）
+
+### M2（总里程碑结论）
+
+1. 修复已按 High -> Medium 串行落地（F1/F3/F4/F2）。
+2. 本地可执行代码级验证通过。
+3. 编译/运行级回归受 Linux + eBPF 环境限制，需 PR 触发 CI 完成最终闭环。

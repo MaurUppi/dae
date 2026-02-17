@@ -187,7 +187,9 @@ func newDispatchTestPlane(t *testing.T, queueSize int) *ControlPlane {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
+	log := logrus.New()
 	return &ControlPlane{
+		log:             log,
 		ctx:             ctx,
 		cancel:          cancel,
 		dnsIngressQueue: make(chan dnsIngressTask, queueSize),
@@ -302,39 +304,106 @@ func TestUdpIngressDispatch_NoSyncFallbackWhenDnsLaneBusy(t *testing.T) {
 	second := dnsIngressTask{data: pool.Get(4)}
 
 	var nonDnsCalled atomic.Bool
-	done := make(chan struct{})
-	go func() {
-		plane.dispatchDnsOrQueue(
-			netip.MustParseAddrPort("192.168.1.10:53000"),
-			netip.MustParseAddrPort("8.8.8.8:53"),
-			second,
-			func() {
-				nonDnsCalled.Store(true)
-			},
-		)
-		close(done)
-	}()
+	plane.dispatchDnsOrQueue(
+		netip.MustParseAddrPort("192.168.1.10:53000"),
+		netip.MustParseAddrPort("8.8.8.8:53"),
+		second,
+		func() {
+			nonDnsCalled.Store(true)
+		},
+	)
 
-	select {
-	case <-done:
-		t.Fatal("dns dispatch should block on full dns lane instead of sync fallback")
-	case <-time.After(150 * time.Millisecond):
+	if got := atomic.LoadUint64(&plane.dnsIngressQueueFullTotal); got != 1 {
+		t.Fatalf("dnsIngressQueueFullTotal=%d, want 1", got)
 	}
-	if nonDnsCalled.Load() {
-		t.Fatal("non-dns fallback path must not be called for dns packet")
-	}
-
-	queued := <-plane.dnsIngressQueue
-	queued.data.Put()
-
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("dns dispatch did not proceed after queue slot became available")
+	if got := atomic.LoadUint64(&plane.dnsIngressDropTotal); got != 1 {
+		t.Fatalf("dnsIngressDropTotal=%d, want 1", got)
 	}
 	if nonDnsCalled.Load() {
 		t.Fatal("non-dns fallback path must remain unused")
 	}
-	queued = <-plane.dnsIngressQueue
+	if len(plane.dnsIngressQueue) != 1 {
+		t.Fatalf("dns ingress queue length=%d, want 1", len(plane.dnsIngressQueue))
+	}
+	queued := <-plane.dnsIngressQueue
 	queued.data.Put()
+}
+
+func TestDrainDnsIngressQueue_DrainsWithoutCountingDrop(t *testing.T) {
+	plane := newDispatchTestPlane(t, 3)
+	plane.dnsIngressQueue <- dnsIngressTask{data: pool.Get(4)}
+	plane.dnsIngressQueue <- dnsIngressTask{data: pool.Get(4)}
+	plane.dnsIngressQueue <- dnsIngressTask{data: pool.Get(4)}
+
+	plane.drainDnsIngressQueue()
+
+	if len(plane.dnsIngressQueue) != 0 {
+		t.Fatalf("dns ingress queue length=%d, want 0", len(plane.dnsIngressQueue))
+	}
+	if got := atomic.LoadUint64(&plane.dnsIngressDropTotal); got != 0 {
+		t.Fatalf("dnsIngressDropTotal=%d, want 0", got)
+	}
+	if got := atomic.LoadUint64(&plane.dnsIngressQueueFullTotal); got != 0 {
+		t.Fatalf("dnsIngressQueueFullTotal=%d, want 0", got)
+	}
+}
+
+func TestAnyfromPoolGetOrCreate_ZeroTTLStillPooled(t *testing.T) {
+	p := NewAnyfromPool()
+	var createCalls atomic.Int32
+	p.createAnyfromFn = func(_ string) (*Anyfrom, error) {
+		createCalls.Add(1)
+		return &Anyfrom{}, nil
+	}
+
+	first, isNew, err := p.GetOrCreate("127.0.0.1:40000", 0)
+	if err != nil {
+		t.Fatalf("GetOrCreate(first): %v", err)
+	}
+	if !isNew {
+		t.Fatal("first GetOrCreate should create new anyfrom")
+	}
+	second, isNew, err := p.GetOrCreate("127.0.0.1:40000", 0)
+	if err != nil {
+		t.Fatalf("GetOrCreate(second): %v", err)
+	}
+	if isNew {
+		t.Fatal("second GetOrCreate should reuse pooled anyfrom")
+	}
+	if first != second {
+		t.Fatal("expected same pooled anyfrom instance for ttl=0")
+	}
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("createAnyfrom calls=%d, want 1", got)
+	}
+}
+
+func TestAnyfromPoolGetOrCreate_NegativeTTLStillPooled(t *testing.T) {
+	p := NewAnyfromPool()
+	var createCalls atomic.Int32
+	p.createAnyfromFn = func(_ string) (*Anyfrom, error) {
+		createCalls.Add(1)
+		return &Anyfrom{}, nil
+	}
+
+	first, isNew, err := p.GetOrCreate("127.0.0.1:40001", -1*time.Second)
+	if err != nil {
+		t.Fatalf("GetOrCreate(first): %v", err)
+	}
+	if !isNew {
+		t.Fatal("first GetOrCreate should create new anyfrom")
+	}
+	second, isNew, err := p.GetOrCreate("127.0.0.1:40001", -1*time.Second)
+	if err != nil {
+		t.Fatalf("GetOrCreate(second): %v", err)
+	}
+	if isNew {
+		t.Fatal("second GetOrCreate should reuse pooled anyfrom")
+	}
+	if first != second {
+		t.Fatal("expected same pooled anyfrom instance for ttl<0")
+	}
+	if got := createCalls.Load(); got != 1 {
+		t.Fatalf("createAnyfrom calls=%d, want 1", got)
+	}
 }
