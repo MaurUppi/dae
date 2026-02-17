@@ -9,7 +9,6 @@ on:
       - ".github/workflows/dns-race.yml"
   push:
     branches:
-      - main
       - dns_fix
     paths:
       - "control/**/*.go"

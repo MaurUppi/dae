@@ -30,9 +30,8 @@ import (
 )
 
 const (
-	MaxDnsLookupDepth        = 3
-	minFirefoxCacheTtl       = 120
-	maxDnsForwarderCacheSize = 128
+	MaxDnsLookupDepth  = 3
+	minFirefoxCacheTtl = 120
 )
 
 type IpVersionPrefer int
@@ -79,11 +78,8 @@ type DnsController struct {
 
 	fixedDomainTtl map[string]int
 	// mutex protects the dnsCache.
-	dnsCacheMu          sync.Mutex
-	dnsCache            map[string]*DnsCache
-	dnsForwarderCacheMu sync.Mutex
-	dnsForwarderCache   map[dnsForwarderKey]DnsForwarder
-	dnsForwarderLastUse map[dnsForwarderKey]time.Time
+	dnsCacheMu sync.Mutex
+	dnsCache   map[string]*DnsCache
 }
 
 type handlingState struct {
@@ -122,40 +118,12 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		bestDialerChooser:     option.BestDialerChooser,
 		timeoutExceedCallback: option.TimeoutExceedCallback,
 
-		fixedDomainTtl:      option.FixedDomainTtl,
-		dnsCacheMu:          sync.Mutex{},
-		dnsCache:            make(map[string]*DnsCache),
-		dnsForwarderCacheMu: sync.Mutex{},
-		dnsForwarderCache:   make(map[dnsForwarderKey]DnsForwarder),
-		dnsForwarderLastUse: make(map[dnsForwarderKey]time.Time),
+		fixedDomainTtl: option.FixedDomainTtl,
+		dnsCacheMu:     sync.Mutex{},
+		dnsCache:       make(map[string]*DnsCache),
 	}, nil
 }
 
-func (c *DnsController) evictDnsForwarderCacheOneLocked() {
-	if len(c.dnsForwarderCache) < maxDnsForwarderCacheSize {
-		return
-	}
-	var (
-		oldestKey   dnsForwarderKey
-		oldestTime  time.Time
-		initialized bool
-	)
-	for key, lastUse := range c.dnsForwarderLastUse {
-		if !initialized || lastUse.Before(oldestTime) {
-			oldestKey = key
-			oldestTime = lastUse
-			initialized = true
-		}
-	}
-	if !initialized {
-		return
-	}
-	if forwarder, ok := c.dnsForwarderCache[oldestKey]; ok {
-		_ = forwarder.Close()
-		delete(c.dnsForwarderCache, oldestKey)
-	}
-	delete(c.dnsForwarderLastUse, oldestKey)
-}
 
 func (c *DnsController) cacheKey(qname string, qtype uint16) string {
 	// To fqdn.
@@ -382,11 +350,6 @@ type dialArgument struct {
 	mptcp        bool
 }
 
-type dnsForwarderKey struct {
-	upstream     string
-	dialArgument dialArgument
-}
-
 func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (err error) {
 	if c.log.IsLevelEnabled(logrus.TraceLevel) && len(dnsMessage.Question) > 0 {
 		q := dnsMessage.Question[0]
@@ -536,7 +499,13 @@ func (c *DnsController) handle_(
 	if err != nil {
 		return fmt.Errorf("pack DNS packet: %w", err)
 	}
-	return c.dialSend(context.Background(), 0, req, data, dnsMessage.Id, upstream, needResp)
+	// Use a context bounded by DnsNatTimeout so that dialSend (and any
+	// recursive calls) can be cancelled when the overall DNS request
+	// deadline is exceeded.  dialSend will further narrow this with
+	// DefaultDialTimeout for the individual upstream connection.
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), DnsNatTimeout)
+	defer dialCancel()
+	return c.dialSend(dialCtx, 0, req, data, dnsMessage.Id, upstream, needResp)
 }
 
 // sendReject_ send empty answer.
@@ -602,35 +571,18 @@ func (c *DnsController) dialSend(ctx context.Context, invokingDepth int, req *ud
 
 	// Dial and send.
 	var respMsg *dnsmessage.Msg
-	// defer in a recursive call will delay Close(), thus we Close() before
-	// the next recursive call. However, a connection cannot be closed twice.
-	// We should set a connClosed flag to avoid it.
-	var connClosed bool
 
 	ctxDial, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
 	defer cancel()
 
-	// get forwarder from cache
-	cacheKeyForwarder := dnsForwarderKey{upstream: upstream.String(), dialArgument: *dialArgument}
-	c.dnsForwarderCacheMu.Lock()
-	forwarder, ok := c.dnsForwarderCache[cacheKeyForwarder]
-	if !ok {
-		c.evictDnsForwarderCacheOneLocked()
-		forwarder, err = newDnsForwarder(upstream, *dialArgument)
-		if err != nil {
-			c.dnsForwarderCacheMu.Unlock()
-			return err
-		}
-		c.dnsForwarderCache[cacheKeyForwarder] = forwarder
+	// Create a new forwarder for each request (no caching: cached forwarders
+	// are always closed after use, making cache hits indistinguishable from
+	// dead connections and causing failures for TCP/TLS upstreams).
+	forwarder, err := newDnsForwarder(upstream, *dialArgument)
+	if err != nil {
+		return err
 	}
-	c.dnsForwarderLastUse[cacheKeyForwarder] = time.Now()
-	c.dnsForwarderCacheMu.Unlock()
-
-	defer func() {
-		if !connClosed {
-			forwarder.Close()
-		}
-	}()
+	defer forwarder.Close()
 
 	respMsg, err = forwarder.ForwardDNS(ctxDial, data)
 	if err != nil {
@@ -661,10 +613,6 @@ func (c *DnsController) dialSend(ctx context.Context, invokingDepth int, req *ud
 	if err != nil {
 		return err
 	}
-
-	// Close conn before the recursive call.
-	forwarder.Close()
-	connClosed = true
 
 	// Route response.
 	upstreamIndex, nextUpstream, err := c.routing.ResponseSelect(respMsg, upstream)
