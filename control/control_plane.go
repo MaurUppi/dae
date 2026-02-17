@@ -45,6 +45,20 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+const (
+	// DNS packets are handled by dedicated workers instead of per-src queue.
+	dnsIngressWorkerCount = 256
+	dnsIngressQueueLength = 2048
+)
+
+type dnsIngressTask struct {
+	data          pool.PB
+	convergeSrc   netip.AddrPort
+	pktDst        netip.AddrPort
+	realDst       netip.AddrPort
+	routingResult *bpfRoutingResult
+}
+
 type ControlPlane struct {
 	log *logrus.Logger
 
@@ -58,6 +72,8 @@ type ControlPlane struct {
 
 	dnsController    *DnsController
 	onceNetworkReady sync.Once
+	dnsIngressQueue  chan dnsIngressTask
+	emitUdpTask      func(key string, task UdpTask)
 
 	dialMode consts.DialMode
 
@@ -390,6 +406,8 @@ func NewControlPlane(
 		outbounds:         outbounds,
 		dnsController:     nil,
 		onceNetworkReady:  sync.Once{},
+		dnsIngressQueue:   make(chan dnsIngressTask, dnsIngressQueueLength),
+		emitUdpTask:       DefaultUdpTaskPool.EmitTask,
 		dialMode:          dialMode,
 		routingMatcher:    routingMatcher,
 		ctx:               ctx,
@@ -731,6 +749,50 @@ func (l *Listener) Close() error {
 	return err
 }
 
+func isDnsPort(port uint16) bool {
+	return port == 53 || port == 5353
+}
+
+func (c *ControlPlane) enqueueDnsIngressTask(task dnsIngressTask) bool {
+	select {
+	case <-c.ctx.Done():
+		task.data.Put()
+		return false
+	case c.dnsIngressQueue <- task:
+		return true
+	}
+}
+
+func (c *ControlPlane) dispatchDnsOrQueue(convergeSrc, pktDst netip.AddrPort, dnsTask dnsIngressTask, nonDnsTask UdpTask) {
+	if isDnsPort(pktDst.Port()) {
+		_ = c.enqueueDnsIngressTask(dnsTask)
+		return
+	}
+	if c.emitUdpTask != nil {
+		c.emitUdpTask(convergeSrc.String(), nonDnsTask)
+		return
+	}
+	DefaultUdpTaskPool.EmitTask(convergeSrc.String(), nonDnsTask)
+}
+
+func (c *ControlPlane) startDnsIngressWorkers(udpConn *net.UDPConn) {
+	for i := 0; i < dnsIngressWorkerCount; i++ {
+		go func() {
+			for {
+				select {
+				case <-c.ctx.Done():
+					return
+				case task := <-c.dnsIngressQueue:
+					if e := c.handlePkt(udpConn, task.data, task.convergeSrc, task.pktDst, task.realDst, task.routingResult, false); e != nil {
+						c.log.Warnln("handlePkt(dns):", e)
+					}
+					task.data.Put()
+				}
+			}
+		}()
+	}
+}
+
 func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err error) {
 	sentReady := false
 	defer func() {
@@ -765,6 +827,7 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 
 	sentReady = true
 	readyChan <- true
+	c.startDnsIngressWorkers(udpConn)
 	go func() {
 		for {
 			select {
@@ -811,9 +874,34 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 			copy(newOob, oob[:oobn])
 			newSrc := src
 			convergeSrc := common.ConvergeAddrPort(src)
+			pktDst := RetrieveOriginalDest(newOob)
+
+			if isDnsPort(pktDst.Port()) {
+				routingResult, routeErr := c.core.RetrieveRoutingResult(newSrc, pktDst, unix.IPPROTO_UDP)
+				if routeErr != nil {
+					c.log.Warnf("No AddrPort presented: %v", routeErr)
+					newBuf.Put()
+					newOob.Put()
+					continue
+				}
+				newOob.Put()
+				c.dispatchDnsOrQueue(
+					convergeSrc,
+					pktDst,
+					dnsIngressTask{
+						data:          newBuf,
+						convergeSrc:   convergeSrc,
+						pktDst:        common.ConvergeAddrPort(pktDst),
+						realDst:       common.ConvergeAddrPort(pktDst),
+						routingResult: routingResult,
+					},
+					nil,
+				)
+				continue
+			}
 			// Debug:
 			// t := time.Now()
-			DefaultUdpTaskPool.EmitTask(convergeSrc.String(), func() {
+			c.dispatchDnsOrQueue(convergeSrc, pktDst, dnsIngressTask{}, func() {
 				data := newBuf
 				oob := newOob
 				src := newSrc

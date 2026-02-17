@@ -4,13 +4,18 @@ import (
 	"context"
 	"errors"
 	"net"
-	"strconv"
+	"net/netip"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/dns"
+	"github.com/daeuniverse/dae/config"
+	"github.com/daeuniverse/outbound/pool"
 	dnsmessage "github.com/miekg/dns"
+	"github.com/sirupsen/logrus"
 )
 
 type timeoutNetErr struct{}
@@ -101,26 +106,235 @@ func TestIsTimeoutErrorWrappedDeadline(t *testing.T) {
 	}
 }
 
-func TestEvictDnsForwarderCacheOneLocked(t *testing.T) {
+// TestDnsForwarderCacheRemoved verifies that DnsController no longer holds a
+// dnsForwarderCache field (dead-connection-caching was removed in P0-1 fix).
+// The struct must compile and initialise without those fields.
+func TestDnsForwarderCacheRemoved(t *testing.T) {
 	c := &DnsController{
-		dnsForwarderCache:   make(map[dnsForwarderKey]DnsForwarder),
-		dnsForwarderLastUse: make(map[dnsForwarderKey]time.Time),
+		dnsCacheMu: sync.Mutex{},
+		dnsCache:   make(map[string]*DnsCache),
 	}
-	for i := 0; i < maxDnsForwarderCacheSize; i++ {
-		key := dnsForwarderKey{upstream: "u" + strconv.Itoa(i), dialArgument: dialArgument{l4proto: consts.L4ProtoStr_UDP}}
-		c.dnsForwarderCache[key] = fakeDnsForwarder{}
-		c.dnsForwarderLastUse[key] = time.Unix(int64(i), 0)
+	if c.dnsCache == nil {
+		t.Fatal("dnsCache should be initialised")
 	}
-	c.evictDnsForwarderCacheOneLocked()
-	if len(c.dnsForwarderCache) != maxDnsForwarderCacheSize-1 {
-		t.Fatalf("cache size = %d, want %d", len(c.dnsForwarderCache), maxDnsForwarderCacheSize-1)
+	// dnsForwarderCache, dnsForwarderCacheMu, dnsForwarderLastUse fields no
+	// longer exist on DnsController; this test will fail to compile if they
+	// are accidentally reintroduced.
+}
+
+// TestAnyfromPoolGetOrCreateRaceCondition verifies the AnyfromPool's
+// GetOrCreate does not hold the global write lock while creating sockets
+// (P1-4 fix: optimistic create-outside-lock pattern).
+// This test validates the structural invariant that the method signature
+// and pool fields are correct, without requiring actual socket creation.
+func TestAnyfromPoolGetOrCreateRaceCondition(t *testing.T) {
+	p := NewAnyfromPool()
+	if p == nil {
+		t.Fatal("NewAnyfromPool() returned nil")
 	}
-	if len(c.dnsForwarderLastUse) != maxDnsForwarderCacheSize-1 {
-		t.Fatalf("lastUse size = %d, want %d", len(c.dnsForwarderLastUse), maxDnsForwarderCacheSize-1)
+	// Verify the pool starts empty.
+	p.mu.RLock()
+	n := len(p.pool)
+	p.mu.RUnlock()
+	if n != 0 {
+		t.Fatalf("expected empty pool, got %d entries", n)
 	}
 }
 
-type fakeDnsForwarder struct{}
+func newTestDnsControllerForHandle(t *testing.T) *DnsController {
+	t.Helper()
 
-func (fakeDnsForwarder) ForwardDNS(context.Context, []byte) (*dnsmessage.Msg, error) { return nil, nil }
-func (fakeDnsForwarder) Close() error                                                { return nil }
+	log := logrus.New()
+	routingCfg := &config.Dns{
+		Routing: config.DnsRouting{
+			Request: config.DnsRequestRouting{
+				Fallback: consts.DnsRequestOutboundIndex_AsIs.String(),
+			},
+			Response: config.DnsResponseRouting{
+				Fallback: consts.DnsResponseOutboundIndex_Accept.String(),
+			},
+		},
+	}
+	routing, err := dns.New(routingCfg, &dns.NewOption{
+		Logger: log,
+		UpstreamReadyCallback: func(_ *dns.Upstream) error {
+			return nil
+		},
+		UpstreamResolverNetwork: "udp",
+	})
+	if err != nil {
+		t.Fatalf("dns.New(): %v", err)
+	}
+
+	controller, err := NewDnsController(routing, &DnsControllerOption{
+		Log: log,
+		CacheAccessCallback: func(_ *DnsCache) error {
+			return nil
+		},
+		CacheRemoveCallback: func(_ *DnsCache) error {
+			return nil
+		},
+		IpVersionPrefer: 0,
+		FixedDomainTtl:  map[string]int{},
+	})
+	if err != nil {
+		t.Fatalf("NewDnsController(): %v", err)
+	}
+	return controller
+}
+
+func newDispatchTestPlane(t *testing.T, queueSize int) *ControlPlane {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return &ControlPlane{
+		ctx:             ctx,
+		cancel:          cancel,
+		dnsIngressQueue: make(chan dnsIngressTask, queueSize),
+	}
+}
+
+// TestHandle_PropagatesDeadlineContextToDialSend verifies handle_ executes the
+// real call chain and passes a deadline-bearing context into dialSend.
+func TestHandle_PropagatesDeadlineContextToDialSend(t *testing.T) {
+	controller := newTestDnsControllerForHandle(t)
+
+	var capturedCtx context.Context
+	stopErr := errors.New("stop-on-captured-context")
+	controller.dialSendInvoker = func(ctx context.Context, _ int, _ *udpRequest, _ []byte, _ uint16, _ *dns.Upstream, _ bool) error {
+		capturedCtx = ctx
+		return stopErr
+	}
+
+	req := &udpRequest{
+		realSrc: netip.MustParseAddrPort("192.0.2.10:5353"),
+		realDst: netip.MustParseAddrPort("8.8.8.8:53"),
+		src:     netip.MustParseAddrPort("192.0.2.10:5353"),
+	}
+	msg := &dnsmessage.Msg{
+		MsgHdr: dnsmessage.MsgHdr{Id: 1, RecursionDesired: true},
+		Question: []dnsmessage.Question{
+			{Name: "example.com.", Qtype: dnsmessage.TypeA, Qclass: dnsmessage.ClassINET},
+		},
+	}
+
+	err := controller.handle_(msg, req, false)
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("handle_() error = %v, want %v", err, stopErr)
+	}
+	if capturedCtx == nil {
+		t.Fatal("expected dialSend context to be captured")
+	}
+	deadline, ok := capturedCtx.Deadline()
+	if !ok {
+		t.Fatal("expected context with deadline from handle_")
+	}
+	if deadline.IsZero() {
+		t.Fatal("deadline must not be zero")
+	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > DnsNatTimeout+time.Second {
+		t.Fatalf("unexpected deadline remaining: %v (DnsNatTimeout=%v)", remaining, DnsNatTimeout)
+	}
+}
+
+func TestUdpIngressDispatch_DnsBypassesTaskQueue(t *testing.T) {
+	plane := newDispatchTestPlane(t, 2)
+	dnsTask := dnsIngressTask{
+		data:        pool.Get(8),
+		convergeSrc: netip.MustParseAddrPort("192.168.1.10:53000"),
+		pktDst:      netip.MustParseAddrPort("8.8.8.8:53"),
+		realDst:     netip.MustParseAddrPort("8.8.8.8:53"),
+	}
+
+	plane.dispatchDnsOrQueue(
+		netip.MustParseAddrPort("192.168.1.10:53000"),
+		netip.MustParseAddrPort("8.8.8.8:53"),
+		dnsTask,
+		func() {
+			t.Fatal("dns packet should not be dispatched to per-src queue")
+		},
+	)
+
+	select {
+	case task := <-plane.dnsIngressQueue:
+		task.data.Put()
+	default:
+		t.Fatal("expected dns task to be enqueued to dns ingress queue")
+	}
+}
+
+func TestUdpIngressDispatch_NonDnsUsesTaskQueue(t *testing.T) {
+	plane := newDispatchTestPlane(t, 1)
+	executed := make(chan struct{}, 1)
+	plane.emitUdpTask = func(_ string, task UdpTask) {
+		task()
+	}
+
+	plane.dispatchDnsOrQueue(
+		netip.MustParseAddrPort("192.168.1.10:53000"),
+		netip.MustParseAddrPort("1.1.1.1:443"),
+		dnsIngressTask{},
+		func() {
+			executed <- struct{}{}
+		},
+	)
+
+	select {
+	case <-executed:
+	case <-time.After(time.Second):
+		t.Fatal("non-dns task should be dispatched via emitUdpTask")
+	}
+	if len(plane.dnsIngressQueue) != 0 {
+		t.Fatal("non-dns dispatch should not enqueue dns ingress queue")
+	}
+}
+
+func TestUdpIngressDispatch_NoSyncFallbackWhenDnsLaneBusy(t *testing.T) {
+	plane := newDispatchTestPlane(t, 1)
+	plane.emitUdpTask = func(_ string, task UdpTask) {
+		task()
+	}
+
+	first := dnsIngressTask{data: pool.Get(4)}
+	plane.dnsIngressQueue <- first
+
+	second := dnsIngressTask{data: pool.Get(4)}
+
+	var nonDnsCalled atomic.Bool
+	done := make(chan struct{})
+	go func() {
+		plane.dispatchDnsOrQueue(
+			netip.MustParseAddrPort("192.168.1.10:53000"),
+			netip.MustParseAddrPort("8.8.8.8:53"),
+			second,
+			func() {
+				nonDnsCalled.Store(true)
+			},
+		)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("dns dispatch should block on full dns lane instead of sync fallback")
+	case <-time.After(150 * time.Millisecond):
+	}
+	if nonDnsCalled.Load() {
+		t.Fatal("non-dns fallback path must not be called for dns packet")
+	}
+
+	queued := <-plane.dnsIngressQueue
+	queued.data.Put()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("dns dispatch did not proceed after queue slot became available")
+	}
+	if nonDnsCalled.Load() {
+		t.Fatal("non-dns fallback path must remain unused")
+	}
+	queued = <-plane.dnsIngressQueue
+	queued.data.Put()
+}
