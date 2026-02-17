@@ -32,7 +32,7 @@ jobs:
       repository: ${{ github.repository }}
       ref: ${{ github.event.pull_request.head.sha }}
       fetch-depth: 0
-      check-runs: ${{ (github.repository_owner == 'daeuniverse' && secrets.GH_APP_ID != '' && secrets.GH_APP_PRIVATE_KEY != '') && '["build", "pr-build-passed"]' || '[]' }}
+      check-runs: ${{ github.repository_owner == 'daeuniverse' && '["build", "pr-build-passed"]' || '[]' }}
     secrets: inherit
 
   build:
@@ -42,11 +42,11 @@ jobs:
     with:
       ref: ${{ github.event.pull_request.head.sha }}
       pr-number: ${{ github.event.pull_request.number }}
-      build-type: ${{ (github.repository_owner == 'daeuniverse' && secrets.GH_APP_ID != '' && secrets.GH_APP_PRIVATE_KEY != '') && 'pr-build' || 'main-build' }}
+      build-type: ${{ github.repository_owner == 'daeuniverse' && 'pr-build' || 'main-build' }}
     secrets: inherit
 
   post-actions:
-    if: ${{ always() && github.repository_owner == 'daeuniverse' && secrets.GH_APP_ID != '' && secrets.GH_APP_PRIVATE_KEY != '' }}
+    if: ${{ always() && github.repository_owner == 'daeuniverse' }}
     needs: [build]
     uses: daeuniverse/ci-seed-jobs/.github/workflows/dae-post-actions.yml@master
     with:
