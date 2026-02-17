@@ -1,6 +1,7 @@
 name: BPF Test
 
 on:
+  workflow_dispatch:
   pull_request:
     paths:
       - "**/*.c"
@@ -27,7 +28,7 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@d632683dd7b4114ad314bca15554477dd762a938 # v4.2.0
+        uses: actions/checkout@v4
         with:
           persist-credentials: false
           fetch-depth: 0
@@ -41,6 +42,15 @@ jobs:
       - name: Run BPF tests
         env: ${{ matrix.env }}
         run: |
+          set -o pipefail
           git submodule update --init
-          sudo CLANG=clang-$VERSION make ebpf-test || (echo "Run 'make ebpf-test' locally to investigate failures"; exit 1)
+          sudo CLANG=clang-$VERSION make ebpf-test 2>&1 | tee bpf-test-clang-$VERSION.log
 
+      - name: Upload BPF test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bpf-test-logs-clang-${{ matrix.env.VERSION }}
+          path: bpf-test-clang-*.log
+          if-no-files-found: ignore
+          retention-days: 7
