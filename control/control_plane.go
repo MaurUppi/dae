@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -47,8 +48,9 @@ import (
 
 const (
 	// DNS packets are handled by dedicated workers instead of per-src queue.
-	dnsIngressWorkerCount = 256
-	dnsIngressQueueLength = 2048
+	dnsIngressWorkerCount   = 256
+	dnsIngressQueueLength   = 2048
+	dnsIngressQueueLogEvery = 100
 )
 
 type dnsIngressTask struct {
@@ -74,6 +76,10 @@ type ControlPlane struct {
 	onceNetworkReady sync.Once
 	dnsIngressQueue  chan dnsIngressTask
 	emitUdpTask      func(key string, task UdpTask)
+	// dnsIngressQueueFullTotal tracks how many DNS packets hit full lane queue.
+	dnsIngressQueueFullTotal uint64
+	// dnsIngressDropTotal tracks dropped DNS packets at ingress (queue full).
+	dnsIngressDropTotal uint64
 
 	dialMode consts.DialMode
 
@@ -753,19 +759,53 @@ func isDnsPort(port uint16) bool {
 	return port == 53 || port == 5353
 }
 
+func (c *ControlPlane) releaseDnsIngressTask(task dnsIngressTask) {
+	if task.data != nil {
+		task.data.Put()
+	}
+}
+
+func (c *ControlPlane) onDnsIngressQueueFull(task dnsIngressTask) {
+	c.releaseDnsIngressTask(task)
+	queueFullTotal := atomic.AddUint64(&c.dnsIngressQueueFullTotal, 1)
+	dropTotal := atomic.AddUint64(&c.dnsIngressDropTotal, 1)
+	if queueFullTotal == 1 || queueFullTotal%dnsIngressQueueLogEvery == 0 {
+		c.log.WithFields(logrus.Fields{
+			"dns_ingress_queue_full_total": queueFullTotal,
+			"dns_ingress_drop_total":       dropTotal,
+		}).Warnln("DNS ingress queue full, dropping packet")
+	}
+}
+
+func (c *ControlPlane) drainDnsIngressQueue() {
+	for {
+		select {
+		case task := <-c.dnsIngressQueue:
+			c.releaseDnsIngressTask(task)
+		default:
+			return
+		}
+	}
+}
+
 func (c *ControlPlane) enqueueDnsIngressTask(task dnsIngressTask) bool {
 	select {
 	case <-c.ctx.Done():
-		task.data.Put()
+		c.releaseDnsIngressTask(task)
 		return false
 	case c.dnsIngressQueue <- task:
 		return true
+	default:
+		c.onDnsIngressQueueFull(task)
+		return false
 	}
 }
 
 func (c *ControlPlane) dispatchDnsOrQueue(convergeSrc, pktDst netip.AddrPort, dnsTask dnsIngressTask, nonDnsTask UdpTask) {
 	if isDnsPort(pktDst.Port()) {
-		_ = c.enqueueDnsIngressTask(dnsTask)
+		if !c.enqueueDnsIngressTask(dnsTask) {
+			return
+		}
 		return
 	}
 	if c.emitUdpTask != nil {
@@ -781,12 +821,17 @@ func (c *ControlPlane) startDnsIngressWorkers(udpConn *net.UDPConn) {
 			for {
 				select {
 				case <-c.ctx.Done():
+					c.drainDnsIngressQueue()
 					return
 				case task := <-c.dnsIngressQueue:
+					if c.ctx.Err() != nil {
+						c.releaseDnsIngressTask(task)
+						continue
+					}
 					if e := c.handlePkt(udpConn, task.data, task.convergeSrc, task.pktDst, task.realDst, task.routingResult, false); e != nil {
 						c.log.Warnln("handlePkt(dns):", e)
 					}
-					task.data.Put()
+					c.releaseDnsIngressTask(task)
 				}
 			}
 		}()

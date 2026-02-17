@@ -163,15 +163,19 @@ func appendUDPSegmentSizeMsg(b []byte, size uint16) []byte {
 type AnyfromPool struct {
 	pool map[string]*Anyfrom
 	mu   sync.RWMutex
+	// createAnyfromFn is a test seam. Production defaults to createAnyfrom.
+	createAnyfromFn func(lAddr string) (*Anyfrom, error)
 }
 
 var DefaultAnyfromPool = NewAnyfromPool()
 
 func NewAnyfromPool() *AnyfromPool {
-	return &AnyfromPool{
+	p := &AnyfromPool{
 		pool: make(map[string]*Anyfrom, 64),
 		mu:   sync.RWMutex{},
 	}
+	p.createAnyfromFn = p.createAnyfrom
+	return p
 }
 
 // createAnyfrom creates a new Anyfrom socket bound to lAddr.
@@ -218,7 +222,11 @@ func (p *AnyfromPool) GetOrCreate(lAddr string, ttl time.Duration) (conn *Anyfro
 	// fd allocation (ListenPacket) under a global write lock.
 	// Two goroutines may both reach here concurrently; the loser discards its
 	// socket.  This wastes one fd transiently but avoids lock contention.
-	newAf, createErr := p.createAnyfrom(lAddr)
+	createAnyfromFn := p.createAnyfromFn
+	if createAnyfromFn == nil {
+		createAnyfromFn = p.createAnyfrom
+	}
+	newAf, createErr := createAnyfromFn(lAddr)
 	if createErr != nil {
 		return nil, true, createErr
 	}
@@ -227,7 +235,9 @@ func (p *AnyfromPool) GetOrCreate(lAddr string, ttl time.Duration) (conn *Anyfro
 	if af, ok = p.pool[lAddr]; ok {
 		// Lost the race: another goroutine inserted first.
 		p.mu.Unlock()
-		_ = newAf.UDPConn.Close() // discard the extra socket
+		if newAf.UDPConn != nil {
+			_ = newAf.UDPConn.Close() // discard the extra socket
+		}
 		return af, false, nil
 	}
 	// Won the race: register the socket and arm the TTL timer.
@@ -241,8 +251,8 @@ func (p *AnyfromPool) GetOrCreate(lAddr string, ttl time.Duration) (conn *Anyfro
 				newAf.Close()
 			}
 		})
-		p.pool[lAddr] = newAf
 	}
+	p.pool[lAddr] = newAf
 	p.mu.Unlock()
 	return newAf, true, nil
 }
