@@ -4,13 +4,18 @@ import (
 	"context"
 	"errors"
 	"net"
+	"net/netip"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/dns"
+	"github.com/daeuniverse/dae/config"
+	"github.com/daeuniverse/outbound/pool"
 	dnsmessage "github.com/miekg/dns"
+	"github.com/sirupsen/logrus"
 )
 
 type timeoutNetErr struct{}
@@ -117,11 +122,6 @@ func TestDnsForwarderCacheRemoved(t *testing.T) {
 	// are accidentally reintroduced.
 }
 
-type fakeDnsForwarder struct{}
-
-func (fakeDnsForwarder) ForwardDNS(context.Context, []byte) (*dnsmessage.Msg, error) { return nil, nil }
-func (fakeDnsForwarder) Close() error                                                { return nil }
-
 // TestAnyfromPoolGetOrCreateRaceCondition verifies the AnyfromPool's
 // GetOrCreate does not hold the global write lock while creating sockets
 // (P1-4 fix: optimistic create-outside-lock pattern).
@@ -141,89 +141,200 @@ func TestAnyfromPoolGetOrCreateRaceCondition(t *testing.T) {
 	}
 }
 
-// TestHandle_ContextHasBoundedTimeout verifies that the context passed to
-// dialSend from handle_() has a finite deadline (bounded by DnsNatTimeout).
-// Regression guard for P1-3: previously context.Background() was passed,
-// making requests impossible to cancel.
-func TestHandle_ContextHasBoundedTimeout(t *testing.T) {
-	// dialSend receives a ctx from handle_(); we verify it is not Background.
-	// The actual context.WithTimeout call is in handle_() itself; we test the
-	// invariant by confirming DnsNatTimeout > 0 and < DefaultDialTimeout is not
-	// true (DnsNatTimeout should be the outer timeout, DefaultDialTimeout inner).
-	if DnsNatTimeout <= 0 {
-		t.Fatal("DnsNatTimeout must be > 0")
+func newTestDnsControllerForHandle(t *testing.T) *DnsController {
+	t.Helper()
+
+	log := logrus.New()
+	routingCfg := &config.Dns{
+		Routing: config.DnsRouting{
+			Request: config.DnsRequestRouting{
+				Fallback: consts.DnsRequestOutboundIndex_AsIs.String(),
+			},
+			Response: config.DnsResponseRouting{
+				Fallback: consts.DnsResponseOutboundIndex_Accept.String(),
+			},
+		},
 	}
-	// Inner timeout (DefaultDialTimeout=8s) must be strictly less than outer
-	// (DnsNatTimeout=17s) to form a valid nested deadline.
-	if consts.DefaultDialTimeout >= DnsNatTimeout {
-		t.Fatalf("DefaultDialTimeout (%v) >= DnsNatTimeout (%v): nested context would be useless", consts.DefaultDialTimeout, DnsNatTimeout)
+	routing, err := dns.New(routingCfg, &dns.NewOption{
+		Logger: log,
+		UpstreamReadyCallback: func(_ *dns.Upstream) error {
+			return nil
+		},
+		UpstreamResolverNetwork: "udp",
+	})
+	if err != nil {
+		t.Fatalf("dns.New(): %v", err)
 	}
-	// Confirm context.WithTimeout produces a context with a finite deadline.
-	ctx, cancel := context.WithTimeout(context.Background(), DnsNatTimeout)
-	defer cancel()
-	deadline, ok := ctx.Deadline()
+
+	controller, err := NewDnsController(routing, &DnsControllerOption{
+		Log: log,
+		CacheAccessCallback: func(_ *DnsCache) error {
+			return nil
+		},
+		CacheRemoveCallback: func(_ *DnsCache) error {
+			return nil
+		},
+		IpVersionPrefer: 0,
+		FixedDomainTtl:  map[string]int{},
+	})
+	if err != nil {
+		t.Fatalf("NewDnsController(): %v", err)
+	}
+	return controller
+}
+
+func newDispatchTestPlane(t *testing.T, queueSize int) *ControlPlane {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	return &ControlPlane{
+		ctx:             ctx,
+		cancel:          cancel,
+		dnsIngressQueue: make(chan dnsIngressTask, queueSize),
+	}
+}
+
+// TestHandle_PropagatesDeadlineContextToDialSend verifies handle_ executes the
+// real call chain and passes a deadline-bearing context into dialSend.
+func TestHandle_PropagatesDeadlineContextToDialSend(t *testing.T) {
+	controller := newTestDnsControllerForHandle(t)
+
+	var capturedCtx context.Context
+	stopErr := errors.New("stop-on-captured-context")
+	controller.dialSendInvoker = func(ctx context.Context, _ int, _ *udpRequest, _ []byte, _ uint16, _ *dns.Upstream, _ bool) error {
+		capturedCtx = ctx
+		return stopErr
+	}
+
+	req := &udpRequest{
+		realSrc: netip.MustParseAddrPort("192.0.2.10:5353"),
+		realDst: netip.MustParseAddrPort("8.8.8.8:53"),
+		src:     netip.MustParseAddrPort("192.0.2.10:5353"),
+	}
+	msg := &dnsmessage.Msg{
+		MsgHdr: dnsmessage.MsgHdr{Id: 1, RecursionDesired: true},
+		Question: []dnsmessage.Question{
+			{Name: "example.com.", Qtype: dnsmessage.TypeA, Qclass: dnsmessage.ClassINET},
+		},
+	}
+
+	err := controller.handle_(msg, req, false)
+	if !errors.Is(err, stopErr) {
+		t.Fatalf("handle_() error = %v, want %v", err, stopErr)
+	}
+	if capturedCtx == nil {
+		t.Fatal("expected dialSend context to be captured")
+	}
+	deadline, ok := capturedCtx.Deadline()
 	if !ok {
-		t.Fatal("context created with WithTimeout must have a deadline")
+		t.Fatal("expected context with deadline from handle_")
 	}
 	if deadline.IsZero() {
 		t.Fatal("deadline must not be zero")
 	}
+	remaining := time.Until(deadline)
+	if remaining <= 0 || remaining > DnsNatTimeout+time.Second {
+		t.Fatalf("unexpected deadline remaining: %v (DnsNatTimeout=%v)", remaining, DnsNatTimeout)
+	}
 }
 
-// TestDnsTasksDoNotBlockTaskQueue verifies that DNS-port tasks (port 53/5353)
-// that are dispatched as goroutines do not block the per-src serial task queue.
-// Regression guard for P1-1 / P2-2: 200 tasks from the same src must all run
-// without being dropped by a queue-length overflow (old limit was 128).
-func TestDnsTasksDoNotBlockTaskQueue(t *testing.T) {
-	const concurrency = 200
-	p := NewUdpTaskPool()
-
-	var (
-		mu      sync.Mutex
-		results []int
-	)
-	done := make(chan struct{})
-
-	// Simulate 200 "slow DNS" tasks submitted from the same source IP.
-	// Each task records its index; we block until all are done.
-	wg := sync.WaitGroup{}
-	wg.Add(concurrency)
-
-	for i := 0; i < concurrency; i++ {
-		i := i
-		p.EmitTask("192.168.1.100:12345", func() {
-			// Simulate go-dispatched DNS: the real code spawns a goroutine
-			// and returns immediately, freeing the queue goroutine. We
-			// replicate that here: record result in a goroutine, then return.
-			go func() {
-				defer wg.Done()
-				mu.Lock()
-				results = append(results, i)
-				mu.Unlock()
-			}()
-			// Task itself returns quickly, just like the DNS go-dispatch path.
-		})
+func TestUdpIngressDispatch_DnsBypassesTaskQueue(t *testing.T) {
+	plane := newDispatchTestPlane(t, 2)
+	dnsTask := dnsIngressTask{
+		data:        pool.Get(8),
+		convergeSrc: netip.MustParseAddrPort("192.168.1.10:53000"),
+		pktDst:      netip.MustParseAddrPort("8.8.8.8:53"),
+		realDst:     netip.MustParseAddrPort("8.8.8.8:53"),
 	}
 
-	// Wait for all goroutines to finish with a generous timeout.
+	plane.dispatchDnsOrQueue(
+		netip.MustParseAddrPort("192.168.1.10:53000"),
+		netip.MustParseAddrPort("8.8.8.8:53"),
+		dnsTask,
+		func() {
+			t.Fatal("dns packet should not be dispatched to per-src queue")
+		},
+	)
+
+	select {
+	case task := <-plane.dnsIngressQueue:
+		task.data.Put()
+	default:
+		t.Fatal("expected dns task to be enqueued to dns ingress queue")
+	}
+}
+
+func TestUdpIngressDispatch_NonDnsUsesTaskQueue(t *testing.T) {
+	plane := newDispatchTestPlane(t, 1)
+	executed := make(chan struct{}, 1)
+	plane.emitUdpTask = func(_ string, task UdpTask) {
+		task()
+	}
+
+	plane.dispatchDnsOrQueue(
+		netip.MustParseAddrPort("192.168.1.10:53000"),
+		netip.MustParseAddrPort("1.1.1.1:443"),
+		dnsIngressTask{},
+		func() {
+			executed <- struct{}{}
+		},
+	)
+
+	select {
+	case <-executed:
+	case <-time.After(time.Second):
+		t.Fatal("non-dns task should be dispatched via emitUdpTask")
+	}
+	if len(plane.dnsIngressQueue) != 0 {
+		t.Fatal("non-dns dispatch should not enqueue dns ingress queue")
+	}
+}
+
+func TestUdpIngressDispatch_NoSyncFallbackWhenDnsLaneBusy(t *testing.T) {
+	plane := newDispatchTestPlane(t, 1)
+	plane.emitUdpTask = func(_ string, task UdpTask) {
+		task()
+	}
+
+	first := dnsIngressTask{data: pool.Get(4)}
+	plane.dnsIngressQueue <- first
+
+	second := dnsIngressTask{data: pool.Get(4)}
+
+	var nonDnsCalled atomic.Bool
+	done := make(chan struct{})
 	go func() {
-		wg.Wait()
+		plane.dispatchDnsOrQueue(
+			netip.MustParseAddrPort("192.168.1.10:53000"),
+			netip.MustParseAddrPort("8.8.8.8:53"),
+			second,
+			func() {
+				nonDnsCalled.Store(true)
+			},
+		)
 		close(done)
 	}()
 
 	select {
 	case <-done:
-	case <-time.After(5 * time.Second):
-		mu.Lock()
-		got := len(results)
-		mu.Unlock()
-		t.Fatalf("timed out: only %d/%d tasks completed", got, concurrency)
+		t.Fatal("dns dispatch should block on full dns lane instead of sync fallback")
+	case <-time.After(150 * time.Millisecond):
+	}
+	if nonDnsCalled.Load() {
+		t.Fatal("non-dns fallback path must not be called for dns packet")
 	}
 
-	mu.Lock()
-	got := len(results)
-	mu.Unlock()
-	if got != concurrency {
-		t.Fatalf("expected %d tasks to complete, got %d", concurrency, got)
+	queued := <-plane.dnsIngressQueue
+	queued.data.Put()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("dns dispatch did not proceed after queue slot became available")
 	}
+	if nonDnsCalled.Load() {
+		t.Fatal("non-dns fallback path must remain unused")
+	}
+	queued = <-plane.dnsIngressQueue
+	queued.data.Put()
 }

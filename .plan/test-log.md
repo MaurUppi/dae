@@ -314,3 +314,110 @@ go test -race -v -run '.' $(go list ./control/... | grep -v 'control/kern/tests'
 ### 结论
 ✅ PASS（静态验证阶段）— 所有修改文件语法无误，vet 仅 BPF 缺失（预期）
 🔄 CI 验证待 push 到 dns_fix 分支后运行 dns-race.yml
+
+---
+
+## dns-perf-fix T7: 长时间运行 DNS 无响应修复（资源与并发治理）
+
+**日期**: 2026-02-17
+**目标**: 修复应用 `dns-fix` 后运行一段时间出现 DNS 无响应的问题（重点排查连接泄漏与异步并发失控）
+
+### 变更摘要
+- `control/dns.go`
+  - 为 `DoH` 增加 `closeDoHClient()`，在重建 client 前关闭旧 transport；`DoH.Close()` 不再空实现
+  - 为 `DoQ` 增加 `closeDoQConnection()`，在连接重建前关闭旧 QUIC 连接；`DoQ.Close()` 不再空实现
+- `control/control_plane.go`
+  - 新增 `maxAsyncDnsInFlight = 512`
+  - `ControlPlane` 增加 `dnsAsyncSem chan struct{}`
+  - DNS 异步分流新增有界并发闸门：信号量满时回退同步处理，避免无限 goroutine 增长导致资源耗尽
+
+### 测试命令
+```bash
+# 1. 代码格式化
+gofmt -w control/dns.go control/control_plane.go
+→ PASS
+
+# 2. 变更统计
+git diff --stat
+→ control/control_plane.go | 43 lines changed
+→ control/dns.go           | 35 lines changed
+→ 2 files changed, 64 insertions(+), 14 deletions(-)
+
+# 3. 本地单测（macOS 环境）
+GOWORK=off go test ./control -run TestIsTimeoutError -count=1
+→ build failed（Linux syscall 常量缺失：netlink/unix IP_TRANSPARENT 等）
+→ 结论：环境限制，与本次改动逻辑无直接冲突
+
+# 4. 本地构建尝试（默认 go.work）
+make APPNAME=dae dae
+→ failed: cannot load module ../cloudpan189-go (go.work 依赖缺失)
+
+# 5. 本地构建尝试（关闭 go.work）
+GOWORK=off make APPNAME=dae dae
+→ failed: 缺少 Linux/BPF 构建环境（headers/errno-base.h、bpfObjects 未生成）
+```
+
+### PR 与 CI 触发记录
+```bash
+git commit -m "fix(dns): prevent long-run dns stall with bounded async and transport cleanup"
+→ [dns_fix 27c7699] 2 files changed, 64 insertions(+), 14 deletions(-)
+
+git push origin dns_fix
+→ pushed: 79d29aa..27c7699
+
+gh pr create --base main --head dns_fix ...
+→ https://github.com/MaurUppi/dae/pull/6
+
+gh pr view 6 --json ...
+→ state: OPEN
+→ checks: DNS Race Test / Kernel Test / PR Build (Preview) 已进入 QUEUED/IN_PROGRESS
+```
+
+### 结论
+✅ PASS（代码落地）— 已完成资源释放与并发上限修复，防止 DNS 长跑场景资源耗尽
+🔄 CI 已触发（PR #6），构建与回归结果以 GitHub Actions 为准
+
+## dns-traceback-fix T8: 全覆盖修复 F1~F5（dispatch + 测试防线）
+
+**日期**: 2026-02-17
+**范围**: 覆盖 `/Users/ouzy/Documents/DevProjects/dae/.plan/code_audit_trace-back.md` 全部 finding
+
+### 变更摘要
+- `control/control_plane.go`
+  - 删除 `dnsAsyncSem` 模型，引入 DNS 专用有界 lane（`dnsIngressQueue` + 固定 worker）
+  - UDP 入口前置 DNS 分流：DNS 不再进入 `DefaultUdpTaskPool.EmitTask`
+  - 新增分流 helper：`dispatchDnsOrQueue(...)`
+- `control/dns_control.go`
+  - 新增内部 seam：`dialSendInvoker`
+  - 新增 `invokeDialSend(...)`，`handle_` 改为通过该调用点进入 `dialSend`
+- `control/dns_improvement_test.go`
+  - 删除无用测试桩 `fakeDnsForwarder`
+  - 用真实调用链测试替换旧 context 常量测试：`TestHandle_PropagatesDeadlineContextToDialSend`
+  - 重写 DNS dispatch 测试：
+    - `TestUdpIngressDispatch_DnsBypassesTaskQueue`
+    - `TestUdpIngressDispatch_NonDnsUsesTaskQueue`
+    - `TestUdpIngressDispatch_NoSyncFallbackWhenDnsLaneBusy`
+
+### 执行命令与结果
+```bash
+# 1) 格式化
+gofmt -w control/control_plane.go control/dns_control.go control/dns_improvement_test.go
+→ PASS
+
+# 2) 本地测试（默认 go.work）
+go test ./control -run 'TestHandle_PropagatesDeadlineContextToDialSend|TestUdpIngressDispatch' -count=1
+→ FAIL: go.work 外部模块缺失（../cloudpan189-go）
+
+# 3) 本地测试（关闭 go.work）
+GOWORK=off go test ./control -run 'TestHandle_PropagatesDeadlineContextToDialSend|TestUdpIngressDispatch' -count=1
+→ FAIL: macOS 缺失 Linux netlink/IP_TRANSPARENT 常量（平台限制）
+
+# 4) Linux 目标编译测试（关闭 go.work）
+GOWORK=off GOOS=linux GOARCH=amd64 go test ./control -run 'TestHandle_PropagatesDeadlineContextToDialSend|TestUdpIngressDispatch' -count=1
+→ FAIL: BPF 生成类型缺失（bpfObjects/bpfRoutingResult），需 CI 的 BPF 生成步骤
+```
+
+### 结论
+- F1~F5 对应代码与测试修复已全部落地。
+- 本地环境无法完成 control 包完整构建回归（go.work 外部依赖 + Linux/BPF 约束）。
+- 最终验证需在 Linux CI（含 BPF 生成链路）完成。

@@ -73,6 +73,7 @@ type DnsController struct {
 	cacheRemoveCallback func(cache *DnsCache) (err error)
 	newCache            func(fqdn string, answers []dnsmessage.RR, deadline time.Time, originalDeadline time.Time) (cache *DnsCache, err error)
 	bestDialerChooser   func(req *udpRequest, upstream *dns.Upstream) (*dialArgument, error)
+	dialSendInvoker     func(ctx context.Context, invokingDepth int, req *udpRequest, data []byte, id uint16, upstream *dns.Upstream, needResp bool) (err error)
 	// timeoutExceedCallback is used to report this dialer is broken for the NetworkType
 	timeoutExceedCallback func(dialArgument *dialArgument, err error)
 
@@ -107,7 +108,7 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		return nil, err
 	}
 
-	return &DnsController{
+	c = &DnsController{
 		routing:     routing,
 		qtypePrefer: prefer,
 
@@ -121,9 +122,10 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		fixedDomainTtl: option.FixedDomainTtl,
 		dnsCacheMu:     sync.Mutex{},
 		dnsCache:       make(map[string]*DnsCache),
-	}, nil
+	}
+	c.dialSendInvoker = c.dialSend
+	return c, nil
 }
-
 
 func (c *DnsController) cacheKey(qname string, qtype uint16) string {
 	// To fqdn.
@@ -426,6 +428,13 @@ func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (er
 	return sendPkt(c.log, resp, req.realDst, req.realSrc, req.src, req.lConn)
 }
 
+func (c *DnsController) invokeDialSend(ctx context.Context, invokingDepth int, req *udpRequest, data []byte, id uint16, upstream *dns.Upstream, needResp bool) (err error) {
+	if c.dialSendInvoker != nil {
+		return c.dialSendInvoker(ctx, invokingDepth, req, data, id, upstream, needResp)
+	}
+	return c.dialSend(ctx, invokingDepth, req, data, id, upstream, needResp)
+}
+
 func (c *DnsController) handle_(
 	dnsMessage *dnsmessage.Msg,
 	req *udpRequest,
@@ -505,7 +514,7 @@ func (c *DnsController) handle_(
 	// DefaultDialTimeout for the individual upstream connection.
 	dialCtx, dialCancel := context.WithTimeout(context.Background(), DnsNatTimeout)
 	defer dialCancel()
-	return c.dialSend(dialCtx, 0, req, data, dnsMessage.Id, upstream, needResp)
+	return c.invokeDialSend(dialCtx, 0, req, data, dnsMessage.Id, upstream, needResp)
 }
 
 // sendReject_ send empty answer.
