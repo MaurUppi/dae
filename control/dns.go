@@ -76,6 +76,21 @@ type DoH struct {
 	client       *http.Client
 }
 
+func closeDoHClient(client *http.Client) error {
+	if client == nil || client.Transport == nil {
+		return nil
+	}
+	// HTTP/1.1 and HTTP/2 transport.
+	if t, ok := client.Transport.(interface{ CloseIdleConnections() }); ok {
+		t.CloseIdleConnections()
+	}
+	// HTTP/3 transport.
+	if closer, ok := client.Transport.(io.Closer); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 func (d *DoH) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
 	if d.client == nil {
 		d.client = d.getClient()
@@ -83,6 +98,7 @@ func (d *DoH) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 	msg, err := sendHttpDNS(ctx, d.client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
 	if err != nil {
 		// If failed to send DNS request, we should try to create a new client.
+		_ = closeDoHClient(d.client)
 		d.client = d.getClient()
 		msg, err = sendHttpDNS(ctx, d.client, d.dialArgument.bestTarget.String(), &d.Upstream, data)
 		if err != nil {
@@ -155,7 +171,9 @@ func (d *DoH) getHttp3RoundTripper() *http3.RoundTripper {
 }
 
 func (d *DoH) Close() error {
-	return nil
+	err := closeDoHClient(d.client)
+	d.client = nil
+	return err
 }
 
 type DoQ struct {
@@ -163,6 +181,13 @@ type DoQ struct {
 	netproxy.Dialer
 	dialArgument dialArgument
 	connection   quic.EarlyConnection
+}
+
+func closeDoQConnection(conn quic.EarlyConnection) error {
+	if conn == nil {
+		return nil
+	}
+	return conn.CloseWithError(0, "")
 }
 
 func (d *DoQ) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, error) {
@@ -176,7 +201,9 @@ func (d *DoQ) ForwardDNS(ctx context.Context, data []byte) (*dnsmessage.Msg, err
 
 	stream, err := d.connection.OpenStreamSync(ctx)
 	if err != nil {
-		// If failed to open stream, we should try to create a new connection.
+		// If failed to open stream, close old connection and try to create a new one.
+		_ = closeDoQConnection(d.connection)
+		d.connection = nil
 		qc, err := d.createConnection(ctx)
 		if err != nil {
 			return nil, err
@@ -230,7 +257,9 @@ func (d *DoQ) createConnection(ctx context.Context) (quic.EarlyConnection, error
 }
 
 func (d *DoQ) Close() error {
-	return nil
+	err := closeDoQConnection(d.connection)
+	d.connection = nil
+	return err
 }
 
 type DoTLS struct {
