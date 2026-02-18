@@ -48,10 +48,32 @@ import (
 
 const (
 	// DNS packets are handled by dedicated workers instead of per-src queue.
-	dnsIngressWorkerCount   = 256
-	dnsIngressQueueLength   = 2048
 	dnsIngressQueueLogEvery = 100
 )
+
+type dnsIngressProfile struct {
+	workers  int
+	queueLen int
+}
+
+var dnsIngressProfiles = map[string]dnsIngressProfile{
+	"lean":       {workers: 32, queueLen: 128},
+	"balanced":   {workers: 256, queueLen: 2048},
+	"aggressive": {workers: 1024, queueLen: 4096},
+}
+
+func resolveDnsIngressProfile(level string, manual config.DnsIngressManual) dnsIngressProfile {
+	if level == "manual" {
+		return dnsIngressProfile{
+			workers:  int(manual.Workers),
+			queueLen: int(manual.Queue),
+		}
+	}
+	if p, ok := dnsIngressProfiles[level]; ok {
+		return p
+	}
+	return dnsIngressProfiles["balanced"]
+}
 
 type dnsIngressTask struct {
 	data          pool.PB
@@ -72,10 +94,11 @@ type ControlPlane struct {
 	outbounds     []*outbound.DialerGroup
 	inConnections sync.Map
 
-	dnsController    *DnsController
-	onceNetworkReady sync.Once
-	dnsIngressQueue  chan dnsIngressTask
-	emitUdpTask      func(key string, task UdpTask)
+	dnsController         *DnsController
+	onceNetworkReady      sync.Once
+	dnsIngressQueue       chan dnsIngressTask
+	dnsIngressWorkerCount int
+	emitUdpTask           func(key string, task UdpTask)
 	// dnsIngressQueueFullTotal tracks how many DNS packets hit full lane queue.
 	dnsIngressQueueFullTotal uint64
 	// dnsIngressDropTotal tracks dropped DNS packets at ingress (queue full).
@@ -404,30 +427,34 @@ func NewControlPlane(
 
 	// New control plane.
 	ctx, cancel := context.WithCancel(context.Background())
+	dnsIngressCfg := resolveDnsIngressProfile(global.DnsPerformanceLevel, global.DnsIngressManual)
 	plane := &ControlPlane{
-		log:               log,
-		core:              core,
-		deferFuncs:        deferFuncs,
-		listenIp:          "0.0.0.0",
-		outbounds:         outbounds,
-		dnsController:     nil,
-		onceNetworkReady:  sync.Once{},
-		dnsIngressQueue:   make(chan dnsIngressTask, dnsIngressQueueLength),
-		emitUdpTask:       DefaultUdpTaskPool.EmitTask,
-		dialMode:          dialMode,
-		routingMatcher:    routingMatcher,
-		ctx:               ctx,
-		cancel:            cancel,
-		ready:             make(chan struct{}),
-		muRealDomainSet:   sync.Mutex{},
-		realDomainSet:     bloom.NewWithEstimates(2048, 0.001),
-		lanInterface:      global.LanInterface,
-		wanInterface:      global.WanInterface,
-		sniffingTimeout:   sniffingTimeout,
-		tproxyPortProtect: global.TproxyPortProtect,
-		soMarkFromDae:     global.SoMarkFromDae,
-		mptcp:             global.Mptcp,
+		log:                   log,
+		core:                  core,
+		deferFuncs:            deferFuncs,
+		listenIp:              "0.0.0.0",
+		outbounds:             outbounds,
+		dnsController:         nil,
+		onceNetworkReady:      sync.Once{},
+		dnsIngressQueue:       make(chan dnsIngressTask, dnsIngressCfg.queueLen),
+		dnsIngressWorkerCount: dnsIngressCfg.workers,
+		emitUdpTask:           DefaultUdpTaskPool.EmitTask,
+		dialMode:              dialMode,
+		routingMatcher:        routingMatcher,
+		ctx:                   ctx,
+		cancel:                cancel,
+		ready:                 make(chan struct{}),
+		muRealDomainSet:       sync.Mutex{},
+		realDomainSet:         bloom.NewWithEstimates(2048, 0.001),
+		lanInterface:          global.LanInterface,
+		wanInterface:          global.WanInterface,
+		sniffingTimeout:       sniffingTimeout,
+		tproxyPortProtect:     global.TproxyPortProtect,
+		soMarkFromDae:         global.SoMarkFromDae,
+		mptcp:                 global.Mptcp,
 	}
+	log.Infof("DNS ingress: level=%s, workers=%d, queue_len=%d",
+		global.DnsPerformanceLevel, dnsIngressCfg.workers, dnsIngressCfg.queueLen)
 	defer func() {
 		if err != nil {
 			cancel()
@@ -816,7 +843,7 @@ func (c *ControlPlane) dispatchDnsOrQueue(convergeSrc, pktDst netip.AddrPort, dn
 }
 
 func (c *ControlPlane) startDnsIngressWorkers(udpConn *net.UDPConn) {
-	for i := 0; i < dnsIngressWorkerCount; i++ {
+	for i := 0; i < c.dnsIngressWorkerCount; i++ {
 		go func() {
 			for {
 				select {

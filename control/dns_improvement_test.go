@@ -348,6 +348,39 @@ func TestDrainDnsIngressQueue_DrainsWithoutCountingDrop(t *testing.T) {
 	}
 }
 
+func TestResolveDnsIngressProfile(t *testing.T) {
+	tests := []struct {
+		name    string
+		level   string
+		manual  config.DnsIngressManual
+		workers int
+		queue   int
+	}{
+		{name: "lean", level: "lean", workers: 32, queue: 128},
+		{name: "balanced", level: "balanced", workers: 256, queue: 2048},
+		{name: "aggressive", level: "aggressive", workers: 1024, queue: 4096},
+		{
+			name:    "manual",
+			level:   "manual",
+			manual:  config.DnsIngressManual{Workers: 512, Queue: 4096},
+			workers: 512,
+			queue:   4096,
+		},
+		{name: "unknown", level: "unknown", workers: 256, queue: 2048},
+		{name: "empty", level: "", workers: 256, queue: 2048},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := resolveDnsIngressProfile(tt.level, tt.manual)
+			if got.workers != tt.workers || got.queueLen != tt.queue {
+				t.Fatalf("resolveDnsIngressProfile(%q, %+v) = {%d, %d}, want {%d, %d}",
+					tt.level, tt.manual, got.workers, got.queueLen, tt.workers, tt.queue)
+			}
+		})
+	}
+}
+
 func TestAnyfromPoolGetOrCreate_ZeroTTLStillPooled(t *testing.T) {
 	p := NewAnyfromPool()
 	var createCalls atomic.Int32
