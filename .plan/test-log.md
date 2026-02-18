@@ -520,3 +520,113 @@ rg -n "TestAnyfromPoolGetOrCreate_ZeroTTLStillPooled|TestAnyfromPoolGetOrCreate_
 1. 修复已按 High -> Medium 串行落地（F1/F3/F4/F2）。
 2. 本地可执行代码级验证通过。
 3. 编译/运行级回归受 Linux + eBPF 环境限制，需 PR 触发 CI 完成最终闭环。
+
+## dns-traceback-3rd-fix T10: DNS ingress 分级可配置化（T1 -> T6 -> M1）
+
+**日期**: 2026-02-18
+**来源**: `/Users/ouzy/Documents/DevProjects/dae/.plan/code_audit_trace-back-3rd.md`
+**执行文档**: `/Users/ouzy/Documents/DevProjects/dae/.plan/code_audit_trace-back-3rd-dev.md`
+
+### T1（config/config.go）新增 dns ingress 配置结构与字段
+
+**变更文件**
+- `config/config.go`
+
+**测试命令与结果**
+```bash
+rg -n "DnsIngressManual|DnsPerformanceLevel|dns_performance_level|dns_ingress_manual" config/config.go
+→ PASS: 命中新类型与 Global 新字段
+```
+
+### T2（config/patch.go）新增 level 校验与 manual clamp
+
+**变更文件**
+- `config/patch.go`
+
+**测试命令与结果**
+```bash
+rg -n "patchDnsPerformanceLevel|dns_performance_level|dns_ingress_manual" config/patch.go
+→ PASS: 命中 patch 注册、fallback、workers/queue clamp 警告
+```
+
+### T3（config/desc.go）补充描述文本
+
+**变更文件**
+- `config/desc.go`
+
+**测试命令与结果**
+```bash
+rg -n "dns_performance_level" config/desc.go
+→ PASS: 命中 GlobalDesc 说明
+```
+
+### T4（control/control_plane.go）profile 查找表与初始化改造
+
+**变更文件**
+- `control/control_plane.go`
+
+**测试命令与结果**
+```bash
+rg -n "dnsIngressProfile|resolveDnsIngressProfile|dnsIngressWorkerCount|DNS ingress: level" control/control_plane.go
+→ PASS: 命中 profile、解析函数、worker 计数与启动日志
+```
+
+### T5（example.dae）补充示例配置
+
+**变更文件**
+- `example.dae`
+
+**测试命令与结果**
+```bash
+rg -n "dns_performance_level|dns_ingress_manual" example.dae
+→ PASS: 命中 level 与 manual 示例注释
+```
+
+### T6（control/dns_improvement_test.go）新增 profile 解析测试
+
+**变更文件**
+- `control/dns_improvement_test.go`
+
+**测试命令与结果**
+```bash
+rg -n "TestResolveDnsIngressProfile" control/dns_improvement_test.go
+→ PASS: 命中新增测试函数
+```
+
+### M1（本地里程碑验证）
+
+**执行命令与结果**
+```bash
+# 1) 格式化
+gofmt -w config/config.go config/patch.go config/desc.go control/control_plane.go control/dns_improvement_test.go
+→ PASS
+
+# 2) 默认 go.work（环境检查）
+go test ./config -run TestPatchDnsPerformanceLevel -count=1
+→ FAIL: go.work 引用了本机缺失模块 ../cloudpan189-go
+
+# 3) 关闭 go.work 的 config 包编译检查
+GOWORK=off go test ./config -run TestPatchDnsPerformanceLevel -count=1
+→ PASS (no tests to run, 编译通过)
+
+# 4) 关闭 go.work 的 config 运行级回归
+GOWORK=off go test ./config -count=1
+→ FAIL: TestMarshal 要求 example.dae 文件权限 <=0640，本机检出为 0644（历史环境约束）
+
+# 5) 关闭 go.work 的 control 包测试（darwin）
+GOWORK=off go test ./control -run TestResolveDnsIngressProfile -count=1
+→ FAIL: 缺失 Linux netlink/IP_TRANSPARENT 常量（平台限制）
+
+# 6) Linux 目标的 control 包编译尝试
+GOWORK=off GOOS=linux GOARCH=amd64 go test ./control -run TestNoSuch -count=1
+→ FAIL: 缺失 bpfObjects/bpfRoutingResult（需 CI eBPF 生成链路）
+
+# 7) config 包 vet 检查（Linux 目标）
+GOWORK=off GOOS=linux GOARCH=amd64 go vet ./config/
+→ FAIL: config/marshal.go 与 config/parser.go 现存 unreachable code（与本次改动无关）
+```
+
+**结论**
+1. T1~T6 代码改动与结构验证全部完成。
+2. 本地受 go.work、darwin/Linux 差异、eBPF 生成链路限制，无法完成 control 包运行级回归。
+3. 下一步需通过 PR 触发 CI（Linux runner）完成编译/测试闭环。
