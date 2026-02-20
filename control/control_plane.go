@@ -49,6 +49,8 @@ import (
 const (
 	// DNS packets are handled by dedicated workers instead of per-src queue.
 	dnsIngressQueueLogEvery = 100
+	// handlePktLogEvery controls how often non-DNS handlePkt errors are logged.
+	handlePktLogEvery = 100
 )
 
 type dnsIngressProfile struct {
@@ -105,6 +107,8 @@ type ControlPlane struct {
 	dnsIngressDropTotal uint64
 	// handlePktDnsErrTotal tracks DNS worker handlePkt errors for log throttling.
 	handlePktDnsErrTotal uint64
+	// handlePktErrTotal tracks non-DNS handlePkt errors for log throttling.
+	handlePktErrTotal uint64
 
 	dialMode consts.DialMode
 
@@ -998,7 +1002,12 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 					realDst = pktDst
 				}
 				if e := c.handlePkt(udpConn, data, convergeSrc, common.ConvergeAddrPort(pktDst), common.ConvergeAddrPort(realDst), routingResult, false); e != nil {
-					c.log.Warnln("handlePkt:", e)
+					total := atomic.AddUint64(&c.handlePktErrTotal, 1)
+					if total == 1 || total%handlePktLogEvery == 0 {
+						c.log.WithFields(logrus.Fields{
+							"total": total,
+						}).Warnln("handlePkt:", e)
+					}
 				}
 			})
 			// if d := time.Since(t); d > 100*time.Millisecond {

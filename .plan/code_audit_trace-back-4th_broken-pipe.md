@@ -1,7 +1,9 @@
 # 非 DNS 相关修复实施计划（Broken Pipe）
 
 > 分支: `main` → 创建新分支 `broken-pipe-fix`
+> 
 > 来源: `code_audit_trace-back-4th.md` 优先级 1（F6/S5 归属迁移后）
+> 
 > 修复原则: 根因在 dae 原始代码，在 main 上创建分支修复
 
 ## 0. 执行策略
@@ -21,6 +23,7 @@
 - `ue.WriteTo()` 失败后有重试（`goto getNew`, MaxRetry=2），但重试时 `dialerGroup.Select()` 仍可能选中同一个断裂节点
 - broken pipe 信息未反馈到 dialer 健康模型
 - 同一源端口最多反复报错 8 次
+- `handlePkt` fast path（复用已有 endpoint）写失败会直接返回，绕过健康反馈与重建
 
 ### F6/S5 归属迁移结论（2026-02-20）
 
@@ -33,6 +36,10 @@
 
 ```
 handlePkt() (udp.go:64)
+  L68: ue, ueExists := DefaultUdpEndpointPool.Get(realSrc)
+  L69-95: fast path (ueExists && ue.SniffedDomain != "")
+    L91: ue.WriteTo(data, dialTarget)
+    L92-94: 写失败直接 return（当前缺少 ReportUnavailable/Remove/重试）
   L149: routingResult.Must > 0 → isDns=false
   L171: retry := 0
   L191: getNew: 标签
@@ -62,15 +69,15 @@ func (d *Dialer) ReportUnavailable(typ *NetworkType, err error) {
 - 后续 `dialerGroup.Select()` 不会选中该 dialer（除非是 FixedPolicy 或只有 1 个 dialer）
 - 定时健康检查成功后自动恢复 `Alive=true`
 
-## T1: broken pipe 后调用 ReportUnavailable 标记 dialer 不健康
+## T1: 两阶段故障处理（先清理重建，再按重复失败标记 dialer 不健康）
 
-**目标**: 解决 F1 和 F2 — broken pipe 后 dialer 应被标记为不健康，重试时避开
+**目标**: 解决 F1 和 F2，同时避免把“单条隧道连接正常关闭”误判为“节点整体不健康”。
 
 **修改文件**: `control/udp.go`
 
 **实现**:
 
-在 L285-303 的 WriteTo 失败处理中，增加 `ReportUnavailable` 调用：
+### A. slow path（L285-303）改为两阶段降级
 
 ```go
 // 现有代码 (L285-303):
@@ -94,23 +101,42 @@ if err != nil {
             // ... debug fields ...
         }).Debugln("Failed to write UDP packet request. Try to remove old UDP endpoint and retry.")
     }
-    // 将 broken pipe / connection reset 等错误反馈到 dialer 健康状态
-    ue.Dialer.ReportUnavailable(networkType, err)
+    // 阶段 1: 首次失败只清理 endpoint 并重试，不立即降级 dialer。
+    // 阶段 2: 同一请求内重复失败（retry > 0）才将错误反馈到 dialer 健康状态。
+    if retry > 0 {
+        ue.Dialer.ReportUnavailable(networkType, err)
+    }
     _ = DefaultUdpEndpointPool.Remove(realSrc, ue)
     retry++
     goto getNew
 }
 ```
 
+### B. fast path（L69-95）补齐失败处理，不再直接 return
+
+当前 fast path（`ueExists && ue.SniffedDomain != ""`）在 `ue.WriteTo` 失败后直接 `return err`，需要改为：
+
+```go
+_, err = ue.WriteTo(data, dialTarget)
+if err == nil {
+    return nil
+}
+// fast path 失败先只清理 endpoint（阶段 1），不立即 ReportUnavailable。
+_ = DefaultUdpEndpointPool.Remove(realSrc, ue)
+// 不直接 return，继续走后续 slow path 的 GetOrCreate + retry 逻辑
+```
+
 **注意事项**:
-1. `ReportUnavailable` 对**所有**写入错误都调用（不仅限 broken pipe），因为 connection refused/timeout 等也说明 dialer 不可用
-2. 这不需要 `isBrokenPipe()` helper — `ReportUnavailable` 接受任意 error
-3. `networkType` 已在 L172-176 定义: `&dialer.NetworkType{L4Proto: "udp", IpVersion: ..., IsDns: false}`
-4. 调用后 `Alive=false`，下次 `getNew` 时 L266 的 `!ue.Dialer.MustGetAlive(networkType)` 会生效（对于已有 endpoint）
-5. 对于新建 endpoint（`isNew=true`），L266 检查不触发，但 `dialerGroup.Select()` 内部也会避开 not-alive dialer
-6. **风险评估**: `ReportUnavailable` 会将 dialer 的 `Alive` 设为 false 并 append `Timeout` 延迟。如果仅一次偶发网络抖动就标记 dialer 为 not alive，可能导致流量不必要地切换。但考虑到：(a) 定时健康检查会快速恢复; (b) 当前的问题是**完全不反馈**导致 15 分钟持续写入断裂隧道，过度反馈远好于不反馈。
+1. `ReportUnavailable` 触发条件改为“同一请求内重复写失败（retry > 0）”，不是首次失败即触发。
+2. 首次失败优先按 endpoint 维度处理（Remove + 重建），符合“单连接失效不等于节点失效”的语义。
+3. 这不需要 `isBrokenPipe()` helper — `ReportUnavailable` 接受任意 error；是否触发由“两阶段策略”控制。
+4. slow path 的 `networkType` 已在 L172-176 定义: `&dialer.NetworkType{L4Proto: "udp", IpVersion: ..., IsDns: false}`
+5. 调用后 `Alive=false`，下次 `getNew` 时 L266 的 `!ue.Dialer.MustGetAlive(networkType)` 会生效（对于已有 endpoint）
+6. 对于新建 endpoint（`isNew=true`），L266 检查不触发，但 `dialerGroup.Select()` 内部也会避开 not-alive dialer
+7. **风险评估**: 两阶段策略降低了“偶发单连接关闭”导致的误降级风险；同时在重复失败时仍可快速熔断，避免持续打到坏节点。
 
 **关键文件**:
+- `control/udp.go:68-95` (fast path 写失败处理)
 - `control/udp.go:285-303` (WriteTo 失败处理)
 - `component/outbound/dialer/connectivity_check.go:564-568` (ReportUnavailable, 只读引用)
 - `component/outbound/dialer/alive_dialer_set.go:144-204` (NotifyLatencyChange, 只读引用)
@@ -119,9 +145,10 @@ if err != nil {
 1. 部署修复后，运行 `dae_triage_unified_v5.sh --service dae --enable-tcpdump --enable-strace --peer-ip 163.177.58.13`
 2. 等待自然 IEPL 断连（或手动关闭一个 IEPL 节点）
 3. **预期**:
-   - broken pipe 后日志显示 `[ALIVE → NOT ALIVE]`（来自 NotifyLatencyChange L186-189）
+   - 首次失败仅 endpoint 重建；重复失败才出现 `[ALIVE → NOT ALIVE]`（来自 NotifyLatencyChange L186-189）
    - 重试时选择其他健康节点
    - 同一源端口的 broken pipe 次数 ≤2（MaxRetry 内）
+   - fast path 失败不再直接返回，能够进入重建与重试路径
 4. **成功标准**:
    - triage 中同一源端口重复事件从 8 次降至 ≤2
    - IEPL 节点断连后恢复时间 ≈ check_interval（而非持续 15+ 分钟）
@@ -199,18 +226,17 @@ func sendPkt(log *logrus.Logger, data []byte, from netip.AddrPort, realTo, to ne
 }
 ```
 
-改为:
+改为（仅在 `EADDRINUSE` 场景触发 fallback）:
 ```go
 func sendPkt(log *logrus.Logger, data []byte, from netip.AddrPort, realTo, to netip.AddrPort, lConn *net.UDPConn) (err error) {
     uConn, _, err := DefaultAnyfromPool.GetOrCreate(from.String(), AnyfromTimeout)
     if err != nil {
-        // Fallback: if bind fails (e.g., address already in use when from == dae's own
-        // DNS listen address), use the main UDP listener to send the response.
-        if lConn != nil {
+        // Only fallback on bind address conflict at dae's own listener address.
+        if errors.Is(err, syscall.EADDRINUSE) && lConn != nil && isConnLocalAddr(lConn, from) {
             _, err = lConn.WriteToUDPAddrPort(data, realTo)
             return err
         }
-        return
+        return err
     }
     _, err = uConn.WriteToUDPAddrPort(data, realTo)
     return err
@@ -218,19 +244,21 @@ func sendPkt(log *logrus.Logger, data []byte, from netip.AddrPort, realTo, to ne
 ```
 
 **注意事项**:
-1. fallback 使用 `lConn`（主 UDP listener）回写。源地址将是 dae 的监听地址（即 `from`），因为 `lConn` 绑定在该地址上
-2. 需要确认 `lConn.WriteToUDPAddrPort` 是否需要 `SO_TRANSPARENT` 权限（`lConn` 已设置，应该可以）
-3. 这是一个 graceful degradation：首选 AnyfromPool（精确源地址匹配），失败时 fallback 到主 listener
+1. fallback 仅用于 `bind: address already in use`（`EADDRINUSE`）且 `from == lConn.LocalAddr()` 的场景，避免掩盖其他错误（如权限、资源耗尽）
+2. fallback 使用 `lConn`（主 UDP listener）回写。源地址将是 dae 的监听地址（即 `from`），因为 `lConn` 绑定在该地址上
+3. 需要确认 `lConn.WriteToUDPAddrPort` 是否需要 `SO_TRANSPARENT` 权限（`lConn` 已设置，应该可以）
+4. 这是一个受限的 graceful degradation：首选 AnyfromPool（精确源地址匹配），仅在地址冲突场景 fallback 到主 listener
+5. 需要在 `udp.go` 增加 `errors`、`syscall` 引入，以及 `isConnLocalAddr(lConn, from)` 辅助函数（比较 listener 本地地址与 `from`）
 
 **关键文件**:
 - `control/udp.go:54-62` (sendPkt)
 
 **测试方法**:
 1. 部署修复后，监控 `journalctl -u dae | grep "address already in use"` 30 分钟
-2. **成功标准**: 30 分钟内零 bind 错误
+2. **成功标准**: `EADDRINUSE` 不再导致响应失败，且日志中其他类型的 `GetOrCreate` 错误仍原样暴露
 3. **回归检查**: DNS 响应正常到达客户端（检查 `dig` 成功率不下降）
 
-## T4: UdpEndpoint.start() 静默退出改进
+## T4: UdpEndpoint.start() 静默退出改进（含可观测性）
 
 **目标**: 解决 F5 — endpoint 失效时主动从池中清除（不等 NAT 超时）
 
@@ -261,7 +289,7 @@ func (ue *UdpEndpoint) start() {
 }
 ```
 
-改为（通过 `Reset(0)` 触发立即清理）:
+改为（通过 `Reset(0)` 触发立即清理 + 增加退出日志）:
 ```go
 func (ue *UdpEndpoint) start() {
     buf := pool.GetFullCap(consts.EthernetMtu)
@@ -269,12 +297,14 @@ func (ue *UdpEndpoint) start() {
     for {
         n, from, err := ue.conn.ReadFrom(buf[:])
         if err != nil {
+            logrus.WithError(err).Warnln("UdpEndpoint read loop exited")
             break
         }
         ue.mu.Lock()
         ue.deadlineTimer.Reset(ue.NatTimeout)
         ue.mu.Unlock()
         if err = ue.handler(buf[:n], from); err != nil {
+            logrus.WithError(err).Warnln("UdpEndpoint handler error, scheduling immediate cleanup")
             break
         }
     }
@@ -300,7 +330,7 @@ ue.deadlineTimer = time.AfterFunc(createOption.NatTimeout, func() {
 })
 ```
 
-`Reset(0)` 替代原来的 `Stop()` 会立即触发此回调，无需为 `start()` 额外引用 log 或 pool key。
+`Reset(0)` 替代原来的 `Stop()` 会立即触发此回调，无需为 `start()` 额外引用 pool key；新增日志用于满足 S4 可观测性目标。
 
 **关键文件**:
 - `control/udp_endpoint_pool.go:40-58` (start)
@@ -308,17 +338,22 @@ ue.deadlineTimer = time.AfterFunc(createOption.NatTimeout, func() {
 
 **测试方法**:
 1. 部署后在 broken pipe 场景观察 endpoint 是否被立即清除
-2. **成功标准**: endpoint 错误后立即从池中消失（不等 NatTimeout）
+2. **成功标准**:
+   - endpoint 错误后立即从池中消失（不等 NatTimeout）
+   - 日志出现 `UdpEndpoint handler error, scheduling immediate cleanup` 或 `UdpEndpoint read loop exited`
 3. **回归检查**: 正常 UDP 流量不受影响
 
-## T5（承接主报告 S5）: CLOSE-WAIT 堆积治理与验收
+## T5（承接主报告 S5）: CLOSE-WAIT 堆积治理与验收（门禁任务）
 
 **目标**: 以 non-DNS 代理路径修复承接 F6/S5，验证 CLOSE-WAIT 显著下降。
+**性质**: 验收门禁任务（T5 不直接引入代码修复；修复来自 T1 两阶段策略 + T4 的完整落地）
 
 **实施方式**:
-1. 以 T1（`ReportUnavailable`）+ T4（endpoint 及时清理）作为 CLOSE-WAIT 治理主路径。
-2. 不修改 dns_fix 的 `DoTCP.Close()`/`newDnsForwarder` 路径，避免误修复。
-3. 将 CLOSE-WAIT 指标纳入 broken-pipe 分支验收门禁。
+1. 以 T1（先 endpoint 重建、重复失败再 `ReportUnavailable`）+ T4（endpoint 及时清理）作为 CLOSE-WAIT 治理主路径。
+2. T1 必须覆盖两条写路径：`udp.go:68-95` fast path + `udp.go:285-303` slow path。
+3. T4 必须同时满足：立即清理 + 退出日志可观测。
+4. 不修改 dns_fix 的 `DoTCP.Close()`/`newDnsForwarder` 路径，避免误修复。
+5. 将 CLOSE-WAIT 指标纳入 broken-pipe 分支验收门禁。
 
 **测试方法**:
 1. 部署 T1-T4 后运行 `dae_triage_unified_v5.sh --service dae --enable-tcpdump --enable-strace --peer-ip 163.177.58.13`
@@ -327,6 +362,7 @@ ue.deadlineTimer = time.AfterFunc(createOption.NatTimeout, func() {
    - CLOSE-WAIT max 从 111 降至 ≤10
    - CLOSE-WAIT remote 仍仅为 IEPL 节点地址（验证归属不漂移）
    - Scenario C 维持 0（不回退 dns_fix 已修复项）
+   - 可从日志/代码路径确认 T1 fast+slow path 与 T4 cleanup+log 已全部生效
 4. 测试记录写入 `.plan/test-log.md`（标题建议：`code_audit_trace-back-4th_broken-pipe: T5 — F6/S5 迁移验收`）
 
 ## M1: 本地验证
@@ -340,7 +376,7 @@ go test -race ./control/ ./component/outbound/...
 ## 任务依赖图
 
 ```
-T1 (dialer 健康反馈) ─┐
+T1 (两阶段健康反馈) ─┐
 T2 (日志节流)         ├→ T5 (F6/S5 验收)
 T3 (sendPkt fallback) ┤
 T4 (endpoint 清理)   ─┘
@@ -354,13 +390,13 @@ T1-T4 互不依赖，可并行开发但需串行测试。建议按 `T1→T2→T3
 
 | 文件 | 改动 | 任务 |
 |---|---|---|
-| `control/udp.go:285-303` | WriteTo 失败后调用 ReportUnavailable | T1 |
+| `control/udp.go:68-95,285-303` | fast/slow path 写失败先清理重建，重复失败再 ReportUnavailable | T1 |
 | `control/control_plane.go:~51` | 新增 `handlePktLogEvery` 常量 | T2 |
 | `control/control_plane.go:~104` | 新增 `handlePktErrTotal` 字段 | T2 |
 | `control/control_plane.go:994` | handlePkt 非 DNS 日志节流 | T2 |
-| `control/udp.go:54-62` | sendPkt fallback 到 lConn | T3 |
-| `control/udp_endpoint_pool.go:40-58` | start() 退出后立即触发清理 | T4 |
-| `.plan/test-log.md` | 新增 F6/S5 迁移验收记录 | T5 |
+| `control/udp.go:54-62` | sendPkt 仅在 EADDRINUSE 且自身监听地址时 fallback 到 lConn | T3 |
+| `control/udp_endpoint_pool.go:40-58` | start() 退出日志 + 立即触发清理 | T4 |
+| `.plan/test-log.md` | 新增 F6/S5 迁移验收记录（门禁） | T5 |
 
 ## CI 要求
 
