@@ -7,14 +7,14 @@ on:
       - "go.mod"
       - "go.sum"
       - ".github/workflows/dns-race.yml"
-  push:
-    branches:
-      - dns_fix
-    paths:
-      - "control/**/*.go"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/dns-race.yml"
+#  push:
+#    branches:
+#      - dns_fix
+#    paths:
+#      - "control/**/*.go"
+#      - "go.mod"
+#      - "go.sum"
+#      - ".github/workflows/dns-race.yml"
 
 jobs:
   race-test:
