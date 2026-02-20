@@ -103,6 +103,8 @@ type ControlPlane struct {
 	dnsIngressQueueFullTotal uint64
 	// dnsIngressDropTotal tracks dropped DNS packets at ingress (queue full).
 	dnsIngressDropTotal uint64
+	// handlePktDnsErrTotal tracks DNS worker handlePkt errors for log throttling.
+	handlePktDnsErrTotal uint64
 
 	dialMode consts.DialMode
 
@@ -856,7 +858,12 @@ func (c *ControlPlane) startDnsIngressWorkers(udpConn *net.UDPConn) {
 						continue
 					}
 					if e := c.handlePkt(udpConn, task.data, task.convergeSrc, task.pktDst, task.realDst, task.routingResult, false); e != nil {
-						c.log.Warnln("handlePkt(dns):", e)
+						total := atomic.AddUint64(&c.handlePktDnsErrTotal, 1)
+						if total == 1 || total%dnsIngressQueueLogEvery == 0 {
+							c.log.WithFields(logrus.Fields{
+								"total": total,
+							}).Warnln("handlePkt(dns):", e)
+						}
 					}
 					c.releaseDnsIngressTask(task)
 				}
