@@ -8,7 +8,9 @@ package control
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/netip"
+	"strings"
 	"sync"
 	"time"
 
@@ -38,13 +40,35 @@ type UdpEndpoint struct {
 	DialTarget    string
 }
 
+// isUdpEndpointNormalClose reports whether err represents a normal (non-error) endpoint
+// teardown: peer EOF, NatTimeout expiry ("use of closed network connection"), or an explicit
+// local close triggered by Reset(0) cleanup.
+func isUdpEndpointNormalClose(err error) bool {
+	if err == nil {
+		return true
+	}
+	if err == io.EOF {
+		return true
+	}
+	// "use of closed network connection" is returned when Reset(0) fires ue.Close() just
+	// before ReadFrom returns; this is the expected cleanup path, not an error.
+	if strings.Contains(err.Error(), "use of closed network connection") {
+		return true
+	}
+	return false
+}
+
 func (ue *UdpEndpoint) start() {
 	buf := pool.GetFullCap(consts.EthernetMtu)
 	defer pool.Put(buf)
 	for {
 		n, from, err := ue.conn.ReadFrom(buf[:])
 		if err != nil {
-			logrus.WithError(err).Warnln("UdpEndpoint read loop exited")
+			if !isUdpEndpointNormalClose(err) {
+				logrus.WithError(err).Warnln("UdpEndpoint read loop exited")
+			} else {
+				logrus.WithError(err).Debugln("UdpEndpoint read loop exited")
+			}
 			break
 		}
 		ue.mu.Lock()
