@@ -1,0 +1,32 @@
+---
+name: Post-Build Actions (Local)
+
+on:
+  workflow_call:
+    inputs:
+      check-run-id:
+        type: string
+        description: "name of the check run"
+        required: true
+      check-run-conclusion:
+        type: string
+        description: "workflow run status (success|failure|skipped|aborted)"
+        required: true
+
+jobs:
+  report-workflow-run:
+    if: ${{ startsWith(github.event.pull_request.head.repo.full_name, github.repository_owner) && inputs.check-run-conclusion != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@master
+        with:
+          repository: daeuniverse/ci-seed-jobs
+          ref: master
+
+      - name: Report workflow run status
+        uses: ./common/report-workflow-run
+        with:
+          app_id: ${{ secrets.GH_APP_ID }}
+          private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          id: ${{ inputs.check-run-id }}
+          conclusion: ${{ inputs.check-run-conclusion }}
