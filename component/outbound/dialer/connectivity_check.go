@@ -18,6 +18,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -59,6 +60,8 @@ type collection struct {
 	Latencies10       *LatenciesN
 	MovingAverage     time.Duration
 	Alive             bool
+	CheckTotal        atomic.Uint64
+	CheckFailureTotal atomic.Uint64
 }
 
 func newCollection() *collection {
@@ -521,6 +524,11 @@ func (d *Dialer) GetCollectionState(typ *NetworkType) (alive bool, lastLatency, 
 	return
 }
 
+func (d *Dialer) GetCollectionCounters(typ *NetworkType) (checkTotal, checkFailureTotal uint64) {
+	col := d.mustGetCollection(typ)
+	return col.CheckTotal.Load(), col.CheckFailureTotal.Load()
+}
+
 // RegisterAliveDialerSet is thread-safe.
 func (d *Dialer) RegisterAliveDialerSet(a *AliveDialerSet) {
 	if a == nil {
@@ -591,6 +599,7 @@ func (d *Dialer) Check(opts *CheckOption) (ok bool, err error) {
 	start := time.Now()
 	// Calc latency.
 	collection := d.mustGetCollection(opts.networkType)
+	collection.CheckTotal.Add(1)
 	ok, err = opts.CheckFunc(ctx, opts.networkType)
 	if ok && err == nil {
 		// Success: update latency and mark alive.
@@ -610,6 +619,7 @@ func (d *Dialer) Check(opts *CheckOption) (ok bool, err error) {
 		d.informDialerGroupUpdate(collection)
 	} else if err != nil {
 		// Failure: mark unavailable only if there's an actual error.
+		collection.CheckFailureTotal.Add(1)
 		d.logUnavailable(collection, opts.networkType, err)
 		d.informDialerGroupUpdate(collection)
 	}
