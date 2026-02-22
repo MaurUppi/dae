@@ -106,6 +106,16 @@ type DnsController struct {
 	dnsForwarderCache sync.Map // map[dnsForwarderKey]*cachedDnsForwarder
 	sf                singleflight.Group
 
+	dnsMetricsInit       sync.Once
+	dnsQueryTotal        atomic.Uint64
+	dnsCacheHitTotal     atomic.Uint64
+	dnsCacheLazyHitTotal atomic.Uint64
+	dnsCacheMissTotal    atomic.Uint64
+	dnsRejectedTotal     atomic.Uint64
+	dnsRefusedTotal      atomic.Uint64
+	dnsResponseLatency   *dnsLatencyHistogram
+	dnsUpstreamMetrics   sync.Map // map[string]*dnsUpstreamMetric
+
 	janitorStop chan struct{}
 	janitorDone chan struct{}
 	evictorDone chan struct{}
@@ -196,9 +206,10 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		bestDialerChooser:     option.BestDialerChooser,
 		timeoutExceedCallback: option.TimeoutExceedCallback,
 
-		fixedDomainTtl:    option.FixedDomainTtl,
-		dnsCache:          sync.Map{},
-		dnsForwarderCache: sync.Map{},
+		fixedDomainTtl:     option.FixedDomainTtl,
+		dnsCache:           sync.Map{},
+		dnsForwarderCache:  sync.Map{},
+		dnsResponseLatency: newDnsLatencyHistogram(),
 
 		janitorStop: make(chan struct{}),
 		janitorDone: make(chan struct{}),
@@ -970,8 +981,20 @@ func (c *DnsController) getOrCreateDnsForwarder(upstream *dns.Upstream, dialArg 
 }
 
 func (c *DnsController) forwardWithDialArg(ctx context.Context, upstream *dns.Upstream, dialArg *dialArgument, data []byte) (*dnsmessage.Msg, error) {
+	upstreamName := "<nil>"
+	if upstream != nil {
+		upstreamName = upstream.String()
+	}
+	upstreamMetric := c.getOrCreateDnsUpstreamMetric(upstreamName)
+	upstreamMetric.queryTotal.Add(1)
+	start := time.Now()
+	defer func() {
+		upstreamMetric.latency.Observe(time.Since(start).Seconds())
+	}()
+
 	entry, err := c.getOrCreateDnsForwarder(upstream, dialArg)
 	if err != nil {
+		upstreamMetric.errTotal.Add(1)
 		return nil, err
 	}
 	entry.beginUse()
@@ -979,6 +1002,7 @@ func (c *DnsController) forwardWithDialArg(ctx context.Context, upstream *dns.Up
 
 	respMsg, err := entry.forwarder.ForwardDNS(ctx, data)
 	if err != nil {
+		upstreamMetric.errTotal.Add(1)
 		c.reportDnsForwardFailure(dialArg, err)
 		return nil, err
 	}
@@ -1037,6 +1061,12 @@ func (c *DnsController) Handle_(ctx context.Context, dnsMessage *dnsmessage.Msg,
 }
 
 func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
+	c.dnsQueryTotal.Add(1)
+	start := time.Now()
+	defer func() {
+		c.observeDnsResponseLatency(time.Since(start))
+	}()
+
 	// Try to acquire semaphore (skip if unlimited)
 	if cap(c.concurrencyLimiter) > 0 {
 		select {
@@ -1084,6 +1114,11 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 
 		// Check cache after routing (non-reject case)
 		if resp, needRefresh := c.LookupDnsRespCache_(dnsMessage, cacheKey, false); resp != nil {
+			if needRefresh {
+				c.dnsCacheLazyHitTotal.Add(1)
+			} else {
+				c.dnsCacheHitTotal.Add(1)
+			}
 			// Cache hit - return immediately without singleflight
 			// OPTIMISTIC CACHE: resp may be stale, trigger background refresh if needed
 			if needRefresh {
@@ -1109,6 +1144,7 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 			}
 			return nil
 		}
+		c.dnsCacheMissTotal.Add(1)
 
 		// Cache miss - use singleflight to coalesce concurrent requests
 		// This prevents thundering herd on upstream DNS servers
@@ -1431,6 +1467,8 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 
 // sendRefusedWithResponseWriter_ sends REFUSED response when overload protection is triggered.
 func (c *DnsController) sendRefusedWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
+	c.dnsRefusedTotal.Add(1)
+
 	dnsMessage.Answer = nil
 	dnsMessage.Rcode = dnsmessage.RcodeRefused
 	dnsMessage.Response = true
@@ -1463,6 +1501,8 @@ func (c *DnsController) sendRefusedWithResponseWriter_(dnsMessage *dnsmessage.Ms
 
 // sendRejectWithResponseWriter_ send empty answer using response writer.
 func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
+	c.dnsRejectedTotal.Add(1)
+
 	dnsMessage.Answer = nil
 	dnsMessage.Rcode = dnsmessage.RcodeSuccess
 	dnsMessage.Response = true
