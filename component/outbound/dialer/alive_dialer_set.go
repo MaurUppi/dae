@@ -102,6 +102,12 @@ func (a *AliveDialerSet) GetRand() *Dialer {
 	return a.inorderedAliveDialerSet[ind]
 }
 
+func (a *AliveDialerSet) AliveCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.inorderedAliveDialerSet)
+}
+
 func (a *AliveDialerSet) SortingLatency(d *Dialer) time.Duration {
 	return a.dialerToLatency[d] + a.dialerToLatencyOffset[d]
 }
@@ -212,6 +218,7 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 
 	if hasLatency {
 		bakOldBestDialer := a.minLatency.dialer
+		bakOldMinSortingLatency := a.minLatency.sortingLatency
 		// Calc minLatency.
 		a.dialerToLatency[dialer] = rawLatency
 		sortingLatency = a.SortingLatency(dialer)
@@ -222,7 +229,7 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 			a.minLatency.dialer = dialer
 		} else if a.minLatency.dialer == dialer {
 			a.minLatency.sortingLatency = sortingLatency
-			if !alive || sortingLatency > a.minLatency.sortingLatency {
+			if !alive || sortingLatency > bakOldMinSortingLatency {
 				// Latency increases.
 				if !alive {
 					a.minLatency.dialer = nil
