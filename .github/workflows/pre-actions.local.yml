@@ -84,15 +84,27 @@ jobs:
 
   instantiate-check-runs:
     needs: [set-vars]
-    if: startsWith(github.event.pull_request.head.repo.full_name, github.repository_owner) && secrets.GH_APP_ID != '' && secrets.GH_APP_PRIVATE_KEY != ''
+    if: startsWith(github.event.pull_request.head.repo.full_name, github.repository_owner)
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         id: ${{ fromJson(needs.set-vars.outputs.check-runs-matrix) }}
     steps:
+      - id: check-gh-app-secrets
+        name: Check GH App secrets
+        env:
+          GH_APP_ID: ${{ secrets.GH_APP_ID }}
+          GH_APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+        run: |
+          if [ -n "$GH_APP_ID" ] && [ -n "$GH_APP_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "GH App secrets are missing; skip check-run instantiation."
+          fi
       - name: Instantiate required check runs
-        if: ${{ inputs.check-runs != '[]' }}
+        if: ${{ inputs.check-runs != '[]' && steps.check-gh-app-secrets.outputs.enabled == 'true' }}
         uses: daeuniverse/ci-seed-jobs/common/instantiate-check-runs@master
         with:
           app_id: ${{ secrets.GH_APP_ID }}
