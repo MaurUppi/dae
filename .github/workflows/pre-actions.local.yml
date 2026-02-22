@@ -1,0 +1,109 @@
+---
+name: Pre-Build Actions (Local)
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        required: true
+        type: string
+      ref:
+        required: true
+        type: string
+      fetch-depth:
+        required: false
+        default: 0
+        type: string
+      check-runs:
+        type: string
+        required: false
+        default: "[]"
+      notify:
+        type: boolean
+        default: false
+    outputs:
+      git_sha_long:
+        description: "git sha (long)"
+        value: ${{ jobs.export-metadata.outputs.git_sha_long }}
+      git_sha_short:
+        description: "git sha (short)"
+        value: ${{ jobs.export-metadata.outputs.git_sha_short }}
+      git_commit_msg:
+        description: "git commit message"
+        value: ${{ jobs.export-metadata.outputs.git_commit_msg }}
+
+jobs:
+  set-vars:
+    runs-on: ubuntu-latest
+    outputs:
+      check-runs-matrix: ${{ steps.set-check-runs-matrix.outputs.check-runs-matrix }}
+    steps:
+      - name: Set check-runs matrix
+        id: set-check-runs-matrix
+        run: |
+          echo "check-runs-matrix=$input" >> $GITHUB_OUTPUT
+        env:
+          input: ${{ inputs.check-runs }}
+
+  export-github-context:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dump GitHub context
+        env:
+          GITHUB_CONTEXT: ${{ toJson(github) }}
+        run: |
+          echo "$GITHUB_CONTEXT"
+
+  export-metadata:
+    runs-on: ubuntu-latest
+    outputs:
+      git_sha_long: ${{ steps.export.outputs.git_sha_long }}
+      git_sha_short: ${{ steps.export.outputs.git_sha_short }}
+      git_commit_msg: ${{ steps.export.outputs.git_commit_msg }}
+    steps:
+      - uses: actions/checkout@master
+        with:
+          repository: ${{ inputs.repository }}
+          fetch-depth: ${{ inputs.fetch-depth }}
+          ref: ${{ inputs.ref }}
+      - name: Get metadata from HEAD
+        id: export
+        run: |
+          echo "git_sha_long=${{ inputs.ref }}" >> $GITHUB_OUTPUT
+          echo "git_sha_short=$(echo ${{ inputs.ref }} | cut -c1-6)" >> $GITHUB_OUTPUT
+          echo "git_commit_msg=$(git log --format=%s -n 1 ${{ inputs.ref }})" >> $GITHUB_OUTPUT
+
+  notify-build-start:
+    if: startsWith(github.event.pull_request.head.repo.full_name, github.repository_owner) && inputs.notify
+    runs-on: ubuntu-latest
+    needs: [export-github-context, export-metadata]
+    steps:
+      - uses: actions/checkout@master
+        with:
+          repository: daeuniverse/ci-seed-jobs
+          ref: master
+      - id: send-notification
+        uses: ./notification/notify-build-start
+        with:
+          telegram_to: ${{ secrets.TELEGRAM_TO }}
+          telegram_token: ${{ secrets.TELEGRAM_TOKEN }}
+          git_sha_long: ${{ needs.export-metadata.outputs.git_sha_long }}
+          git_sha_short: ${{ needs.export-metadata.outputs.git_sha_short }}
+          git_commit_msg: ${{ needs.export-metadata.outputs.git_commit_msg }}
+
+  instantiate-check-runs:
+    needs: [set-vars]
+    if: startsWith(github.event.pull_request.head.repo.full_name, github.repository_owner)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        id: ${{ fromJson(needs.set-vars.outputs.check-runs-matrix) }}
+    steps:
+      - name: Instantiate required check runs
+        if: ${{ inputs.check-runs != '[]' }}
+        uses: daeuniverse/ci-seed-jobs/common/instantiate-check-runs@master
+        with:
+          app_id: ${{ secrets.GH_APP_ID }}
+          private_key: ${{ secrets.GH_APP_PRIVATE_KEY }}
+          id: "dae-bot[bot]/${{ matrix.id }}"
