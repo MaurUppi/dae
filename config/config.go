@@ -46,13 +46,25 @@ type Global struct {
 	SniffingTimeout        time.Duration    `mapstructure:"sniffing_timeout" default:"100ms"`
 	TlsImplementation      string           `mapstructure:"tls_implementation" default:"tls"`
 	UtlsImitate            string           `mapstructure:"utls_imitate" default:"chrome_auto"`
+	TlsFragment            bool             `mapstructure:"tls_fragment" default:"false"`
+	TlsFragmentLength      string           `mapstructure:"tls_fragment_length" default:"50-100"`
+	TlsFragmentInterval    string           `mapstructure:"tls_fragment_interval" default:"10-20"`
 	PprofPort              uint16           `mapstructure:"pprof_port" default:"0"`
 	Mptcp                  bool             `mapstructure:"mptcp" default:"false"`
 	FallbackResolver       string           `mapstructure:"fallback_resolver" default:"8.8.8.8:53"`
 	BandwidthMaxTx         string           `mapstructure:"bandwidth_max_tx" default:"0"`
 	BandwidthMaxRx         string           `mapstructure:"bandwidth_max_rx" default:"0"`
+	UDPHopInterval         time.Duration    `mapstructure:"udphop_interval" default:"30s"`
 	DnsPerformanceLevel    string           `mapstructure:"dns_performance_level" default:"balanced"`
 	DnsIngressManual       DnsIngressManual `mapstructure:"dns_ingress_manual"`
+	// Endpoint (metrics + diagnostics)
+	EndpointListenAddress     string `mapstructure:"endpoint_listen_address" default:""`
+	EndpointUsername          string `mapstructure:"endpoint_username" default:""`
+	EndpointPassword          string `mapstructure:"endpoint_password" default:""`
+	EndpointTlsCertificate    string `mapstructure:"endpoint_tls_certificate" default:""`
+	EndpointTlsKey            string `mapstructure:"endpoint_tls_key" default:""`
+	EndpointPrometheusEnabled bool   `mapstructure:"endpoint_prometheus_enabled" default:"false"`
+	EndpointPrometheusPath    string `mapstructure:"endpoint_prometheus_path" default:"/metrics"`
 }
 
 type Utls struct {
@@ -121,10 +133,14 @@ type DnsRouting struct {
 }
 type KeyableString string
 type Dns struct {
-	IpVersionPrefer int             `mapstructure:"ipversion_prefer"`
-	FixedDomainTtl  []KeyableString `mapstructure:"fixed_domain_ttl"`
-	Upstream        []KeyableString `mapstructure:"upstream"`
-	Routing         DnsRouting      `mapstructure:"routing"`
+	IpVersionPrefer    int             `mapstructure:"ipversion_prefer"`
+	FixedDomainTtl     []KeyableString `mapstructure:"fixed_domain_ttl"`
+	Upstream           []KeyableString `mapstructure:"upstream"`
+	Routing            DnsRouting      `mapstructure:"routing"`
+	Bind               string          `mapstructure:"bind"`
+	OptimisticCache    bool            `mapstructure:"optimistic_cache" default:"true"`
+	OptimisticCacheTtl int             `mapstructure:"optimistic_cache_ttl" default:"60"`
+	MaxCacheSize       int             `mapstructure:"max_cache_size" default:"0"`
 }
 
 type Routing struct {

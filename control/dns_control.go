@@ -132,6 +132,27 @@ func (c *DnsController) cacheKey(qname string, qtype uint16) string {
 	return dnsmessage.CanonicalName(qname) + strconv.Itoa(int(qtype))
 }
 
+func (c *DnsController) CacheSize() int {
+	c.dnsCacheMu.Lock()
+	defer c.dnsCacheMu.Unlock()
+	return len(c.dnsCache)
+}
+
+// ConcurrencyInfo returns in-flight request count and limit.
+// This implementation uses handling map size as in-flight and has no hard limit.
+func (c *DnsController) ConcurrencyInfo() (inUse, limit int) {
+	c.handling.Range(func(_, _ interface{}) bool {
+		inUse++
+		return true
+	})
+	return inUse, 0
+}
+
+// ForwarderCacheInfo is empty on this branch because forwarders are not cached.
+func (c *DnsController) ForwarderCacheInfo() (count int, inFlightByUpstream map[string]int32) {
+	return 0, map[string]int32{}
+}
+
 func (c *DnsController) RemoveDnsRespCache(cacheKey string) {
 	c.dnsCacheMu.Lock()
 	_, ok := c.dnsCache[cacheKey]
