@@ -298,7 +298,7 @@ func (c *DnsController) ConcurrencyInfo() (inUse, limit int) {
 	if limit == 0 {
 		return 0, 0
 	}
-	inUse = limit - len(c.concurrencyLimiter)
+	inUse = len(c.concurrencyLimiter)
 	return
 }
 

@@ -166,3 +166,30 @@ func TestDnsController_HandleWithResponseWriterCountsQuery(t *testing.T) {
 		t.Fatalf("unexpected response latency count: got=%d want=1", latency.Count)
 	}
 }
+
+func TestDnsController_ConcurrencyInfo(t *testing.T) {
+	c := &DnsController{
+		concurrencyLimiter: make(chan struct{}, 3),
+	}
+
+	inUse, limit := c.ConcurrencyInfo()
+	if limit != 3 || inUse != 0 {
+		t.Fatalf("unexpected initial concurrency info: inUse=%d limit=%d", inUse, limit)
+	}
+
+	c.concurrencyLimiter <- struct{}{}
+	c.concurrencyLimiter <- struct{}{}
+
+	inUse, limit = c.ConcurrencyInfo()
+	if limit != 3 || inUse != 2 {
+		t.Fatalf("unexpected in-use concurrency info: inUse=%d limit=%d", inUse, limit)
+	}
+
+	<-c.concurrencyLimiter
+	<-c.concurrencyLimiter
+
+	inUse, limit = c.ConcurrencyInfo()
+	if limit != 3 || inUse != 0 {
+		t.Fatalf("unexpected released concurrency info: inUse=%d limit=%d", inUse, limit)
+	}
+}
