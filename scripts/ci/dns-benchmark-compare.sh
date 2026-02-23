@@ -25,6 +25,7 @@ cd "$REPO_ROOT"
 
 BASE_REF="${1:-${BASE_REF:-origin/main}}"
 HEAD_REF="${2:-${HEAD_REF:-HEAD}}"
+BASE_COMMIT_STRATEGY="${BASE_COMMIT_STRATEGY:-merge-base}"
 BENCH_PACKAGE="${BENCH_PACKAGE:-./control}"
 BENCH_FILTER="${BENCH_FILTER:-^Benchmark(AsyncCache|SingleflightOverhead|HighQpsScenario|RealisticDnsQuery|DnsController_Singleflight|PipelinedConn_Concurrent|PipelinedConn_Sequential)$}"
 BENCH_COUNT="${BENCH_COUNT:-3}"
@@ -71,7 +72,17 @@ resolve_ref() {
 resolve_ref "$BASE_REF" || die "cannot resolve base ref: $BASE_REF"
 resolve_ref "$HEAD_REF" || die "cannot resolve head ref: $HEAD_REF"
 
-BASE_COMMIT="$(git merge-base "$BASE_REF" "$HEAD_REF")"
+case "$BASE_COMMIT_STRATEGY" in
+  merge-base)
+    BASE_COMMIT="$(git merge-base "$BASE_REF" "$HEAD_REF")"
+    ;;
+  exact)
+    BASE_COMMIT="$(git rev-parse "$BASE_REF")"
+    ;;
+  *)
+    die "unsupported BASE_COMMIT_STRATEGY: $BASE_COMMIT_STRATEGY (expected merge-base|exact)"
+    ;;
+esac
 HEAD_COMMIT="$(git rev-parse "$HEAD_REF")"
 
 log "base ref: $BASE_REF ($BASE_COMMIT)"
@@ -217,7 +228,8 @@ REPORT_MD="$ARTIFACT_DIR/report.md"
   echo "## DNS Benchmark Compare"
   echo
   echo "- Base ref: \`$BASE_REF\`"
-  echo "- Base commit (merge-base): \`$BASE_COMMIT\`"
+  echo "- Base strategy: \`$BASE_COMMIT_STRATEGY\`"
+  echo "- Base commit: \`$BASE_COMMIT\`"
   echo "- Head ref: \`$HEAD_REF\`"
   echo "- Head commit: \`$HEAD_COMMIT\`"
   echo "- Package: \`$BENCH_PACKAGE\`"

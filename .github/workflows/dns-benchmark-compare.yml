@@ -9,6 +9,9 @@ on:
       - "go.mod"
       - "go.sum"
       - "scripts/ci/dns-benchmark-compare.sh"
+      - "scripts/ci/dns-benchmark-suite-runner.sh"
+      - "scripts/ci/dns-benchmark-suites.sh"
+      - "scripts/ci/benchmarks/**"
       - ".github/workflows/dns-benchmark-compare.yml"
   workflow_dispatch:
     inputs:
@@ -20,10 +23,26 @@ on:
         description: "Head ref to benchmark"
         required: false
         default: "HEAD"
-      bench_filter:
-        description: "Regex to select benchmark names"
+      base_strategy:
+        description: "Base commit strategy: merge-base or exact"
         required: false
-        default: "^Benchmark(AsyncCache|SingleflightOverhead|HighQpsScenario|RealisticDnsQuery|DnsController_Singleflight|PipelinedConn_Concurrent|PipelinedConn_Sequential)$"
+        default: "merge-base"
+      suite_profile:
+        description: "Suite profile: quick or dns-module"
+        required: false
+        default: "dns-module"
+      suite_list:
+        description: "Optional comma-separated suite list. Overrides profile."
+        required: false
+        default: ""
+      bench_count:
+        description: "go test -count"
+        required: false
+        default: "3"
+      bench_time:
+        description: "go test -benchtime"
+        required: false
+        default: "200ms"
 
 permissions:
   contents: read
@@ -34,7 +53,7 @@ jobs:
     name: DNS Bench Compare
     runs-on: ubuntu-22.04
     continue-on-error: true
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     steps:
       - name: Checkout
@@ -63,100 +82,63 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run Benchmark Compare
-        env:
-          BENCH_FILTER: ${{ github.event.inputs.bench_filter }}
         run: |
           set -euo pipefail
           chmod +x scripts/ci/dns-benchmark-compare.sh
+          chmod +x scripts/ci/dns-benchmark-suite-runner.sh
           mkdir -p bench-artifacts
           if [[ "${{ github.event_name }}" == "pull_request" ]]; then
             BASE_REF="origin/${{ github.base_ref }}"
             HEAD_REF="${{ github.sha }}"
+            BASE_STRATEGY="merge-base"
+            SUITE_PROFILE="dns-module"
+            SUITE_LIST=""
+            BENCH_COUNT="3"
+            BENCH_TIME="200ms"
           else
             BASE_REF="${{ github.event.inputs.base_ref }}"
             HEAD_REF="${{ github.event.inputs.head_ref }}"
+            BASE_STRATEGY="${{ github.event.inputs.base_strategy }}"
+            SUITE_PROFILE="${{ github.event.inputs.suite_profile }}"
+            SUITE_LIST="${{ github.event.inputs.suite_list }}"
+            BENCH_COUNT="${{ github.event.inputs.bench_count }}"
+            BENCH_TIME="${{ github.event.inputs.bench_time }}"
           fi
-          overall=0
-          run_suite() {
-            suite="$1"
-            pkg="$2"
-            filter="$3"
-            exclude_files="${4:-}"
-            suite_dir="bench-artifacts/${suite}"
-            mkdir -p "$suite_dir"
-            set +e
-            BENCH_PACKAGE="$pkg" \
-            BENCH_FILTER="$filter" \
-            BENCH_OVERLAY_DIR="$PWD/scripts/ci/benchmarks" \
-            BENCH_EXCLUDE_TEST_FILES="$exclude_files" \
-            ARTIFACT_DIR="$PWD/$suite_dir" \
-            ./scripts/ci/dns-benchmark-compare.sh "$BASE_REF" "$HEAD_REF" \
-              2>&1 | tee "$suite_dir/run.log"
-            status=${PIPESTATUS[0]}
-            set -e
-            if [[ $status -ne 0 && ! -f "$suite_dir/report.md" ]]; then
-              {
-                echo "## DNS Benchmark Compare (${suite})"
-                echo
-                echo "- Status: failed"
-                echo "- Exit code: \`$status\`"
-                echo "- Base ref: \`$BASE_REF\`"
-                echo "- Head ref: \`$HEAD_REF\`"
-                echo "- Package: \`$pkg\`"
-                echo
-                echo "### Failure Log (tail)"
-                echo
-                echo '```text'
-                tail -n 200 "$suite_dir/run.log" || true
-                echo '```'
-              } > "$suite_dir/report.md"
-            fi
-            echo "$status" > "$suite_dir/status.txt"
-            if [[ $status -ne 0 ]]; then
-              overall=1
-            fi
-          }
 
-          run_suite "control_dns" \
-            "./control" \
-            "^Benchmark(AsyncCache|SingleflightOverhead|HighQpsScenario|RealisticDnsQuery|DnsController_Singleflight|PipelinedConn_Concurrent|PipelinedConn_Sequential)$" \
-            "control/tcp_test.go,control/tcp_splice_bench_test.go"
+          set +e
+          DNS_BENCH_PROFILE="$SUITE_PROFILE" \
+          DNS_BENCH_SUITES="$SUITE_LIST" \
+          BENCH_COUNT="$BENCH_COUNT" \
+          BENCH_TIME="$BENCH_TIME" \
+          BASE_COMMIT_STRATEGY="$BASE_STRATEGY" \
+          ARTIFACT_DIR="$PWD/bench-artifacts" \
+          ./scripts/ci/dns-benchmark-suite-runner.sh "$BASE_REF" "$HEAD_REF" \
+            2>&1 | tee bench-artifacts/run.log
+          status=${PIPESTATUS[0]}
+          set -e
 
-          run_suite "component_dns" \
-            "./component/dns" \
-            "^BenchmarkUpstreamResolver_GetUpstream_(Serial|Parallel)$"
-
-          {
-            echo "## DNS Benchmark Compare"
-            echo
-            echo "- Base ref: \`$BASE_REF\`"
-            echo "- Head ref: \`$HEAD_REF\`"
-            echo
-            echo "### Suite Status"
-            echo
-            control_status="$(cat bench-artifacts/control_dns/status.txt 2>/dev/null || echo 1)"
-            comp_status="$(cat bench-artifacts/component_dns/status.txt 2>/dev/null || echo 1)"
-            echo "- control_dns: $([[ \"$control_status\" == \"0\" ]] && echo 'success' || echo 'failed')"
-            echo "- component_dns: $([[ \"$comp_status\" == \"0\" ]] && echo 'success' || echo 'failed')"
-            echo
-            echo "### control_dns"
-            echo
-            if [[ -f bench-artifacts/control_dns/report.md ]]; then
-              cat bench-artifacts/control_dns/report.md
-            else
-              echo "_No report generated_"
-            fi
-            echo
-            echo "### component_dns"
-            echo
-            if [[ -f bench-artifacts/component_dns/report.md ]]; then
-              cat bench-artifacts/component_dns/report.md
-            else
-              echo "_No report generated_"
-            fi
-          } > bench-artifacts/report.md
-
-          exit $overall
+          if [[ $status -ne 0 && ! -f bench-artifacts/report.md ]]; then
+            {
+              echo "## DNS Benchmark Compare"
+              echo
+              echo "- Status: failed"
+              echo "- Exit code: \`$status\`"
+              echo "- Base ref: \`$BASE_REF\`"
+              echo "- Head ref: \`$HEAD_REF\`"
+              echo "- Base strategy: \`$BASE_STRATEGY\`"
+              echo "- Suite profile: \`$SUITE_PROFILE\`"
+              if [[ -n "$SUITE_LIST" ]]; then
+                echo "- Suite selection: \`$SUITE_LIST\`"
+              fi
+              echo
+              echo "### Failure Log (tail)"
+              echo
+              echo '```text'
+              tail -n 200 bench-artifacts/run.log || true
+              echo '```'
+            } > bench-artifacts/report.md
+          fi
+          exit $status
 
       - name: Upload Benchmark Artifacts
         if: always()
