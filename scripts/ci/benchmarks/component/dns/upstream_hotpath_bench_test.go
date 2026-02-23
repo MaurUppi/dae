@@ -37,18 +37,30 @@ func benchmarkInitializedResolver(b *testing.B) *UpstreamResolver {
 	if !stateField.IsValid() {
 		b.Fatalf("unsupported UpstreamResolver layout")
 	}
-	store := stateField.Addr().MethodByName("Store")
-	if !store.IsValid() || store.Type().NumIn() != 1 {
-		b.Fatalf("state.Store method unavailable")
+	// atomic.Pointer[T] internals: write pointer directly into field "v".
+	vField := stateField.FieldByName("v")
+	if !vField.IsValid() {
+		b.Fatalf("atomic pointer backing field not found")
 	}
-	statePtrType := store.Type().In(0) // *upstreamState
-	state := reflect.New(statePtrType.Elem())
+	if vField.Type().Kind() != reflect.UnsafePointer {
+		b.Fatalf("unexpected atomic backing field type: %v", vField.Type())
+	}
+	// Derive *upstreamState type from stateField methods.
+	load := stateField.Addr().MethodByName("Load")
+	if !load.IsValid() || load.Type().NumOut() != 1 {
+		b.Fatalf("state.Load method unavailable")
+	}
+	upstreamStatePtrType := load.Type().Out(0)
+	if upstreamStatePtrType.Kind() != reflect.Pointer {
+		b.Fatalf("unexpected Load output type: %v", upstreamStatePtrType)
+	}
+	state := reflect.New(upstreamStatePtrType.Elem())
 	stateUpstreamField := state.Elem().FieldByName("upstream")
 	if !stateUpstreamField.IsValid() {
 		b.Fatalf("upstreamState.upstream field missing")
 	}
 	setField(stateUpstreamField, reflect.ValueOf(up))
-	store.Call([]reflect.Value{state})
+	setField(vField, reflect.ValueOf(unsafe.Pointer(state.Pointer())))
 	return r
 }
 
