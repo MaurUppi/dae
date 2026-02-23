@@ -30,6 +30,8 @@ BENCH_FILTER="${BENCH_FILTER:-^Benchmark(AsyncCache|SingleflightOverhead|HighQps
 BENCH_COUNT="${BENCH_COUNT:-3}"
 BENCH_TIME="${BENCH_TIME:-200ms}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-bench-artifacts}"
+BENCH_OVERLAY_DIR="${BENCH_OVERLAY_DIR:-}"
+BENCH_EXCLUDE_TEST_FILES="${BENCH_EXCLUDE_TEST_FILES:-}"
 KEEP_WORKTREES="${KEEP_WORKTREES:-0}"
 WORKTREE_ROOT="${WORKTREE_ROOT:-$(mktemp -d -t dae-dns-bench-XXXXXX)}"
 
@@ -89,7 +91,48 @@ prepare_tree() {
     export BPF_STRIP_FLAG="${BPF_STRIP_FLAG:--no-strip}"
     export BPF_CFLAGS="${BPF_CFLAGS:--O2 -Wall -Werror -DMAX_MATCH_SET_LEN=1024}"
     export BPF_TARGET="${BPF_TARGET:-bpfel}"
-    go generate ./control/control.go >/dev/null
+    if [[ "$BENCH_PACKAGE" == "./control"* || "$BENCH_PACKAGE" == "control"* ]]; then
+      go generate ./control/control.go >/dev/null
+    fi
+  )
+}
+
+apply_overlay() {
+  local wt="$1"
+  if [[ -z "$BENCH_OVERLAY_DIR" ]]; then
+    return 0
+  fi
+  local overlay_abs="$BENCH_OVERLAY_DIR"
+  if [[ ! -d "$overlay_abs" ]]; then
+    die "overlay dir does not exist: $overlay_abs"
+  fi
+  while IFS= read -r src; do
+    local rel="${src#$overlay_abs/}"
+    local dst="$wt/$rel"
+    mkdir -p "$(dirname "$dst")"
+    cp "$src" "$dst"
+  done < <(find "$overlay_abs" -type f | sort)
+}
+
+exclude_test_files() {
+  local wt="$1"
+  if [[ -z "$BENCH_EXCLUDE_TEST_FILES" ]]; then
+    return 0
+  fi
+  IFS=',' read -r -a patterns <<<"$BENCH_EXCLUDE_TEST_FILES"
+  (
+    cd "$wt"
+    shopt -s nullglob
+    : > .bench_excluded_files
+    for raw in "${patterns[@]}"; do
+      pat="$(echo "$raw" | xargs)"
+      [[ -z "$pat" ]] && continue
+      for f in $pat; do
+        [[ -f "$f" ]] || continue
+        mv "$f" "${f}.bench_disabled"
+        echo "$f" >> .bench_excluded_files
+      done
+    done
   )
 }
 
@@ -132,12 +175,16 @@ run_benchmarks() {
       -benchmem \
       -count "$BENCH_COUNT" \
       -benchtime "$BENCH_TIME" \
-      | tee "$REPO_ROOT/$output_file"
+      | tee "$output_file"
   )
 }
 
 prepare_tree "$BASE_WT"
 prepare_tree "$HEAD_WT"
+apply_overlay "$BASE_WT"
+apply_overlay "$HEAD_WT"
+exclude_test_files "$BASE_WT"
+exclude_test_files "$HEAD_WT"
 
 BASE_LIST="$ARTIFACT_DIR/base_benchmarks.txt"
 HEAD_LIST="$ARTIFACT_DIR/head_benchmarks.txt"
@@ -177,6 +224,12 @@ REPORT_MD="$ARTIFACT_DIR/report.md"
   echo "- Benchmark filter: \`$BENCH_FILTER\`"
   echo "- Benchmark count: \`$BENCH_COUNT\`"
   echo "- Benchmark time: \`$BENCH_TIME\`"
+  if [[ -n "$BENCH_OVERLAY_DIR" ]]; then
+    echo "- Overlay dir: \`$BENCH_OVERLAY_DIR\`"
+  fi
+  if [[ -n "$BENCH_EXCLUDE_TEST_FILES" ]]; then
+    echo "- Excluded test files: \`$BENCH_EXCLUDE_TEST_FILES\`"
+  fi
   echo
   echo "### Common Benchmarks"
   echo
