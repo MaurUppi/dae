@@ -1,0 +1,143 @@
+name: DNS Benchmark Compare
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "control/**"
+      - "component/dns/**"
+      - "go.mod"
+      - "go.sum"
+      - "scripts/ci/dns-benchmark-compare.sh"
+      - ".github/workflows/dns-benchmark-compare.yml"
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Base ref for merge-base (for example: origin/main)"
+        required: false
+        default: "origin/main"
+      head_ref:
+        description: "Head ref to benchmark"
+        required: false
+        default: "HEAD"
+      bench_filter:
+        description: "Regex to select benchmark names"
+        required: false
+        default: "^Benchmark(AsyncCache|SingleflightOverhead|HighQpsScenario|RealisticDnsQuery|DnsController_Singleflight|PipelinedConn_Concurrent|PipelinedConn_Sequential)$"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench-compare:
+    name: DNS Bench Compare
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.mod
+            go.sum
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang llvm make
+
+      - name: Install benchstat
+        run: |
+          GOTOOLCHAIN=auto go install golang.org/x/perf/cmd/benchstat@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Run Benchmark Compare
+        env:
+          BENCH_FILTER: ${{ github.event.inputs.bench_filter }}
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci/dns-benchmark-compare.sh
+          mkdir -p bench-artifacts
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_REF="origin/${{ github.base_ref }}"
+            HEAD_REF="${{ github.sha }}"
+          else
+            BASE_REF="${{ github.event.inputs.base_ref }}"
+            HEAD_REF="${{ github.event.inputs.head_ref }}"
+          fi
+          set +e
+          ./scripts/ci/dns-benchmark-compare.sh "$BASE_REF" "$HEAD_REF" 2>&1 | tee bench-artifacts/run.log
+          status=${PIPESTATUS[0]}
+          set -e
+          if [[ $status -ne 0 && ! -f bench-artifacts/report.md ]]; then
+            {
+              echo "## DNS Benchmark Compare"
+              echo
+              echo "- Status: failed"
+              echo "- Exit code: \`$status\`"
+              echo "- Base ref: \`$BASE_REF\`"
+              echo "- Head ref: \`$HEAD_REF\`"
+              echo
+              echo "### Failure Log (tail)"
+              echo
+              echo '```text'
+              tail -n 200 bench-artifacts/run.log || true
+              echo '```'
+            } > bench-artifacts/report.md
+          fi
+          exit $status
+
+      - name: Upload Benchmark Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dns-benchmark-compare-${{ github.run_id }}
+          path: bench-artifacts
+          if-no-files-found: warn
+
+      - name: Update PR Comment
+        if: always() && github.event_name == 'pull_request' && hashFiles('bench-artifacts/report.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const marker = "<!-- dae-dns-benchmark-compare -->";
+            const report = fs.readFileSync("bench-artifacts/report.md", "utf8");
+            const body = `${marker}\n${report}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100
+            });
+
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body
+              });
+            }
