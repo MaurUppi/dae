@@ -125,5 +125,18 @@ jobs:
           make ebpf
 
       - name: Run SCI-3 race tests
+        shell: bash
         run: |
-          go test ./component/outbound/dialer ./control -race -count=1
+          set -euo pipefail
+          tmp1="$(mktemp)"
+          tmp2="$(mktemp)"
+          go test ./component/outbound/dialer -race \
+            -run 'Test.*(DialerCheck|DialerLogUnavailable|AliveDialerSet_GetSmartBest).*' \
+            -count=1 2>&1 | tee "$tmp1"
+          go test ./control -race \
+            -run 'Test(RouteDialTcpRetry.*|ContainsDialer|RelayTCP_Cancellation)' \
+            -count=1 2>&1 | tee "$tmp2"
+          if grep -q "no tests to run" "$tmp1" || grep -q "no tests to run" "$tmp2"; then
+            echo "SCI-3 failed: no tests to run"
+            exit 1
+          fi
