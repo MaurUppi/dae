@@ -23,6 +23,8 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+const tcpDialMaxRetry = 2
+
 func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err error) {
 	defer lConn.Close()
 
@@ -102,6 +104,15 @@ type RouteDialParam struct {
 	Mark        uint32
 }
 
+func containsDialer(dialers []*dialer.Dialer, target *dialer.Dialer) bool {
+	for _, d := range dialers {
+		if d == target {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *ControlPlane) RouteDialTcp(ctx context.Context, p *RouteDialParam) (conn netproxy.Conn, err error) {
 	routingResult := &bpfRoutingResult{
 		Mark:     p.Mark,
@@ -157,36 +168,63 @@ func (c *ControlPlane) RouteDialTcp(ctx context.Context, p *RouteDialParam) (con
 		IsDns:     false,
 	}
 	strictIpVersion := dialIp
-	d, _, err := outbound.Select(networkType, strictIpVersion)
-	if err != nil {
-		return nil, fmt.Errorf("failed to select dialer from group %v (%v): %w", outbound.Name, networkType.String(), err)
-	}
+	var (
+		lastErr     error
+		triedDialer []*dialer.Dialer
+	)
+	for retry := 0; retry <= tcpDialMaxRetry; retry++ {
+		d, _, selectErr := outbound.Select(networkType, strictIpVersion)
+		if selectErr != nil {
+			if lastErr != nil {
+				break
+			}
+			return nil, fmt.Errorf("failed to select dialer from group %v (%v): %w", outbound.Name, networkType.String(), selectErr)
+		}
+		if retry > 0 && containsDialer(triedDialer, d) {
+			break
+		}
 
-	if c.log.IsLevelEnabled(logrus.InfoLevel) {
-		c.log.WithFields(logrus.Fields{
-			"network":  networkType.String(),
-			"outbound": outbound.Name,
-			"policy":   outbound.GetSelectionPolicy(),
-			"dialer":   d.Property().Name,
-			"sniffed":  domain,
-			"ip":       RefineAddrPortToShow(dst),
-			"pid":      routingResult.Pid,
-			"dscp":     routingResult.Dscp,
-			"pname":    ProcessName2String(routingResult.Pname[:]),
-			"mac":      Mac2String(routingResult.Mac[:]),
-		}).Infof("%v <-> %v", RefineSourceToShow(src, dst.Addr()), dialTarget)
+		if c.log.IsLevelEnabled(logrus.InfoLevel) {
+			fields := logrus.Fields{
+				"network":  networkType.String(),
+				"outbound": outbound.Name,
+				"policy":   outbound.GetSelectionPolicy(),
+				"dialer":   d.Property().Name,
+				"sniffed":  domain,
+				"ip":       RefineAddrPortToShow(dst),
+				"pid":      routingResult.Pid,
+				"dscp":     routingResult.Dscp,
+				"pname":    ProcessName2String(routingResult.Pname[:]),
+				"mac":      Mac2String(routingResult.Mac[:]),
+			}
+			if retry > 0 {
+				fields["retry"] = retry
+			}
+			c.log.WithFields(fields).Infof("%v <-> %v", RefineSourceToShow(src, dst.Addr()), dialTarget)
+		}
+
+		dialCtx, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
+		conn, lastErr = d.DialContext(dialCtx, common.MagicNetwork("tcp", routingResult.Mark, c.mptcp), dialTarget)
+		cancel()
+		if lastErr == nil {
+			c.AddTcpConnectionTotal(networkType.StringWithoutDns(), outbound.Name)
+			return conn, nil
+		}
+
+		triedDialer = append(triedDialer, d)
+		d.ReportUnavailable(networkType, lastErr)
+		if c.log.IsLevelEnabled(logrus.DebugLevel) {
+			c.log.WithFields(logrus.Fields{
+				"dialer": d.Property().Name,
+				"retry":  retry,
+				"err":    lastErr.Error(),
+			}).Debugln("TCP dial failed, trying next dialer")
+		}
 	}
-	// Use the provided context with timeout for dial operation.
-	// The context is expected to be a per-connection context with its own lifetime,
-	// not the ControlPlane's lifecycle context (c.ctx).
-	dialCtx, cancel := context.WithTimeout(ctx, consts.DefaultDialTimeout)
-	defer cancel()
-	conn, err = d.DialContext(dialCtx, common.MagicNetwork("tcp", routingResult.Mark, c.mptcp), dialTarget)
-	if err != nil {
-		return nil, err
+	if lastErr == nil {
+		return nil, fmt.Errorf("failed to select dialer from group %v (%v): no available dialer", outbound.Name, networkType.String())
 	}
-	c.AddTcpConnectionTotal(networkType.StringWithoutDns(), outbound.Name)
-	return conn, nil
+	return nil, lastErr
 }
 
 type WriteCloser interface {

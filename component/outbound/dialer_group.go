@@ -54,7 +54,8 @@ func NewDialerGroup(
 	case consts.DialerSelectionPolicy_Random,
 		consts.DialerSelectionPolicy_MinLastLatency,
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
-		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+		consts.DialerSelectionPolicy_Smart:
 		// Need to know the alive state or latency.
 		needAliveState = true
 
@@ -282,6 +283,14 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, policy *DialerSel
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
 		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
 		d, latency := a.GetMinLatency()
+		if d == nil {
+			// No alive dialer.
+			return nil, time.Hour, ErrNoAliveDialer
+		}
+		return d, latency, nil
+
+	case consts.DialerSelectionPolicy_Smart:
+		d, latency := a.GetSmartBest()
 		if d == nil {
 			// No alive dialer.
 			return nil, time.Hour, ErrNoAliveDialer

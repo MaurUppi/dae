@@ -1,0 +1,119 @@
+name: Policy Smart SCI
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "common/**/*.go"
+      - "component/**/*.go"
+      - "control/**/*.go"
+      - "go.mod"
+      - "go.sum"
+      - ".github/workflows/policy-smart-sci.yml"
+  workflow_dispatch:
+
+permissions: read-all
+
+jobs:
+  sci-1:
+    name: SCI-1 Strategy Correctness
+    runs-on: ubuntu-22.04
+    env:
+      GOWORK: off
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.mod
+            go.sum
+
+      - name: Run SCI-1 tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          go test ./component/outbound/dialer ./component/outbound \
+            -run 'Test.*(Smart|Penalty|EMA|EffectiveLatency|Cap).*' \
+            -count=1 2>&1 | tee "$tmp"
+          if grep -q "no tests to run" "$tmp"; then
+            echo "SCI-1 failed: no tests to run"
+            exit 1
+          fi
+
+  sci-2:
+    name: SCI-2 TCP Retry Semantics
+    runs-on: ubuntu-22.04
+    env:
+      GOWORK: off
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.mod
+            go.sum
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang llvm make
+
+      - name: Prepare BPF generated files
+        run: |
+          git submodule update --init --recursive
+          make ebpf
+
+      - name: Run SCI-2 tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp)"
+          go test ./control \
+            -run 'TestRouteDialTcp.*(Retry|Fallback|AllFailed|Dedup|Timeout).*|TestContainsDialer' \
+            -count=1 2>&1 | tee "$tmp"
+          if grep -q "no tests to run" "$tmp"; then
+            echo "SCI-2 failed: no tests to run"
+            exit 1
+          fi
+
+  sci-3:
+    name: SCI-3 Concurrency Race
+    runs-on: ubuntu-22.04
+    env:
+      GOWORK: off
+      CGO_ENABLED: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.mod
+            go.sum
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang llvm make gcc
+
+      - name: Prepare BPF generated files
+        run: |
+          git submodule update --init --recursive
+          make ebpf
+
+      - name: Run SCI-3 race tests
+        run: |
+          go test ./component/outbound/dialer ./control -race -count=1

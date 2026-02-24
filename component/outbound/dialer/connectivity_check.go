@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -34,7 +35,17 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const Timeout = 10 * time.Second
+const (
+	Timeout = 10 * time.Second
+
+	emaAlphaPenalty  = 0.5
+	emaAlphaRecovery = 0.3
+
+	basePenalty       = 1.0
+	maxPenaltyPoints  = 50.0
+	maxConsecutiveCap = 5
+	successDecayRate  = 0.7
+)
 
 type NetworkType struct {
 	L4Proto   consts.L4ProtoStr
@@ -56,12 +67,14 @@ func (t *NetworkType) StringWithoutDns() string {
 
 type collection struct {
 	// AliveDialerSetSet uses reference counting.
-	AliveDialerSetSet AliveDialerSetSet
-	Latencies10       *LatenciesN
-	MovingAverage     time.Duration
-	Alive             bool
-	CheckTotal        atomic.Uint64
-	CheckFailureTotal atomic.Uint64
+	AliveDialerSetSet   AliveDialerSetSet
+	Latencies10         *LatenciesN
+	MovingAverage       time.Duration
+	PenaltyPoints       float64
+	ConsecutiveFailures int
+	Alive               bool
+	CheckTotal          atomic.Uint64
+	CheckFailureTotal   atomic.Uint64
 }
 
 func newCollection() *collection {
@@ -523,7 +536,6 @@ func (d *Dialer) GetCollectionState(typ *NetworkType) (alive bool, lastLatency, 
 	avg10, _ = col.Latencies10.AvgLatency()
 	return
 }
-
 func (d *Dialer) GetCollectionCounters(typ *NetworkType) (checkTotal, checkFailureTotal uint64) {
 	col := d.mustGetCollection(typ)
 	return col.CheckTotal.Load(), col.CheckFailureTotal.Load()
@@ -573,8 +585,19 @@ func (d *Dialer) logUnavailable(
 		}).Debugln("Connectivity Check Failed")
 	}
 	collection.Latencies10.AppendLatency(Timeout)
-	collection.MovingAverage = (collection.MovingAverage + Timeout) / 2
+	collection.MovingAverage = time.Duration(
+		float64(collection.MovingAverage)*(1-emaAlphaPenalty) + float64(Timeout)*emaAlphaPenalty,
+	)
 	collection.Alive = false
+	collection.ConsecutiveFailures++
+	exponent := collection.ConsecutiveFailures
+	if exponent > maxConsecutiveCap {
+		exponent = maxConsecutiveCap
+	}
+	collection.PenaltyPoints += basePenalty * math.Pow(2, float64(exponent-1))
+	if collection.PenaltyPoints > maxPenaltyPoints {
+		collection.PenaltyPoints = maxPenaltyPoints
+	}
 }
 
 func (d *Dialer) informDialerGroupUpdate(collection *collection) {
@@ -606,8 +629,12 @@ func (d *Dialer) Check(opts *CheckOption) (ok bool, err error) {
 		latency := time.Since(start)
 		collection.Latencies10.AppendLatency(latency)
 		avg, _ := collection.Latencies10.AvgLatency()
-		collection.MovingAverage = (collection.MovingAverage + latency) / 2
+		collection.MovingAverage = time.Duration(
+			float64(collection.MovingAverage)*(1-emaAlphaRecovery) + float64(latency)*emaAlphaRecovery,
+		)
 		collection.Alive = true
+		collection.ConsecutiveFailures = 0
+		collection.PenaltyPoints *= successDecayRate
 
 		d.Log.WithFields(logrus.Fields{
 			"network": opts.networkType.String(),
