@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"syscall"
@@ -12,31 +13,31 @@ import (
 )
 
 // mockConn implements netproxy.Conn for testing
-type mockConn struct {
+type benchMockConn struct {
 	net.TCPConn
 	reader *io.PipeReader
 	writer *io.PipeWriter
 }
 
-func newMockConnPair() (c1, c2 *mockConn) {
+func newMockConnPair() (c1, c2 *benchMockConn) {
 	r1, w1 := io.Pipe()
 	r2, w2 := io.Pipe()
 
-	c1 = &mockConn{reader: r1, writer: w2}
-	c2 = &mockConn{reader: r2, writer: w1}
+	c1 = &benchMockConn{reader: r1, writer: w2}
+	c2 = &benchMockConn{reader: r2, writer: w1}
 	return c1, c2
 }
 
-func (m *mockConn) Read(b []byte) (n int, err error)  { return m.reader.Read(b) }
-func (m *mockConn) Write(b []byte) (n int, err error) { return m.writer.Write(b) }
-func (m *mockConn) Close() error {
+func (m *benchMockConn) Read(b []byte) (n int, err error)  { return m.reader.Read(b) }
+func (m *benchMockConn) Write(b []byte) (n int, err error) { return m.writer.Write(b) }
+func (m *benchMockConn) Close() error {
 	m.reader.Close()
 	m.writer.Close()
 	return nil
 }
-func (m *mockConn) SetDeadline(t time.Time) error      { return nil }
-func (m *mockConn) SetReadDeadline(t time.Time) error  { return nil }
-func (m *mockConn) SetWriteDeadline(t time.Time) error { return nil }
+func (m *benchMockConn) SetDeadline(t time.Time) error      { return nil }
+func (m *benchMockConn) SetReadDeadline(t time.Time) error  { return nil }
+func (m *benchMockConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // BenchmarkTCPRelayWithMock benchmarks TCP relay with mock connections
 func BenchmarkTCPRelayWithMock(b *testing.B) {
@@ -149,9 +150,33 @@ func (r *reader) Read(b []byte) (n int, err error) {
 	return n, nil
 }
 
+func (r *reader) Write(_ []byte) (n int, err error) {
+	return 0, errors.New("write not supported")
+}
+
+func (r *reader) Close() error { return nil }
+
+func (r *reader) SetDeadline(_ time.Time) error { return nil }
+
+func (r *reader) SetReadDeadline(_ time.Time) error { return nil }
+
+func (r *reader) SetWriteDeadline(_ time.Time) error { return nil }
+
 type mockWriter struct {
 	*io.PipeWriter
 }
+
+func (m *mockWriter) Read(_ []byte) (n int, err error) { return 0, io.EOF }
+
+func (m *mockWriter) Close() error {
+	return m.PipeWriter.Close()
+}
+
+func (m *mockWriter) SetDeadline(_ time.Time) error { return nil }
+
+func (m *mockWriter) SetReadDeadline(_ time.Time) error { return nil }
+
+func (m *mockWriter) SetWriteDeadline(_ time.Time) error { return nil }
 
 func (m *mockWriter) SyscallConn() (syscall.RawConn, error) {
 	// Return nil to simulate non-splice path
