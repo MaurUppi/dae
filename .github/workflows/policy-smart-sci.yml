@@ -19,6 +19,7 @@ permissions:
 jobs:
   sci-1:
     name: SCI-1 Strategy Correctness
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'feat/policy-smart') || startsWith(github.head_ref, 'policy-smart')
     runs-on: ubuntu-22.04
     env:
       GOWORK: off
@@ -48,6 +49,7 @@ jobs:
 
   sci-2:
     name: SCI-2 TCP Retry Semantics
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'feat/policy-smart') || startsWith(github.head_ref, 'policy-smart')
     runs-on: ubuntu-22.04
     env:
       GOWORK: off
@@ -89,6 +91,7 @@ jobs:
 
   sci-3:
     name: SCI-3 Concurrency Race
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.head_ref, 'feat/policy-smart') || startsWith(github.head_ref, 'policy-smart')
     runs-on: ubuntu-22.04
     env:
       GOWORK: off
@@ -134,8 +137,8 @@ jobs:
           fi
 
   report:
-    name: SCI PR Comment
-    if: always() && github.event_name == 'pull_request'
+    name: Update PR Comment
+    if: always() && github.event_name == 'pull_request' && (startsWith(github.head_ref, 'feat/policy-smart') || startsWith(github.head_ref, 'policy-smart'))
     needs: [sci-1, sci-2, sci-3]
     runs-on: ubuntu-22.04
     permissions:
@@ -173,13 +176,15 @@ jobs:
               { name: "SCI-3 Concurrency Race", result: process.env.SCI3_RESULT || "unknown" },
             ];
 
+            const passCount = jobs.filter((j) => j.result === "success").length;
             const allSuccess = jobs.every((j) => j.result === "success");
             const summary = allSuccess ? "pass" : "not pass";
             const body = [
               marker,
-              "## Policy Smart SCI",
+              "## Policy Smart SCI Summary",
               "",
-              `- Summary: **${summary}**`,
+              `- Scope: \`${context.payload.pull_request.head.ref}\` -> \`${context.payload.pull_request.base.ref}\``,
+              `- Overall: **${summary}** (${passCount}/${jobs.length} passed)`,
               `- Workflow run: ${process.env.RUN_URL}`,
               "",
               "### Job Status",
