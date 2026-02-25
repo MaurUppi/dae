@@ -1,16 +1,6 @@
 name: Policy Smart SCI
 
 on:
-  push:
-    branches:
-      - feat/policy-smart
-    paths:
-      - "common/**/*.go"
-      - "component/**/*.go"
-      - "control/**/*.go"
-      - "go.mod"
-      - "go.sum"
-      - ".github/workflows/policy-smart-sci.yml"
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
     paths:

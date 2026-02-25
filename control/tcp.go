@@ -210,6 +210,9 @@ func (c *ControlPlane) RouteDialTcp(ctx context.Context, p *RouteDialParam) (con
 			c.AddTcpConnectionTotal(networkType.StringWithoutDns(), outbound.Name)
 			return conn, nil
 		}
+		if errors.Is(lastErr, context.Canceled) || errors.Is(lastErr, net.ErrClosed) {
+			return nil, lastErr
+		}
 
 		triedDialer = append(triedDialer, d)
 		d.ReportUnavailable(networkType, lastErr)

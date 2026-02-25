@@ -192,3 +192,32 @@ func TestRouteDialTcpRetry_Dedup(t *testing.T) {
 		t.Fatalf("dedup should avoid retrying the same dialer, got call count=%d", impl1.CallCount())
 	}
 }
+
+func TestRouteDialTcpRetry_CanceledDoesNotPoisonDialer(t *testing.T) {
+	impl1 := &scriptedDialer{err: context.Canceled}
+	impl2 := &scriptedDialer{conn: newMockConn(false, nil)}
+	d1 := newTestRouteDialer(t, "d1", impl1)
+	d2 := newTestRouteDialer(t, "d2", impl2)
+
+	cp := newTestControlPlaneWithGroup(consts.DialerSelectionPolicy_MinLastLatency, []*dialer.Dialer{d1, d2})
+	networkType := &dialer.NetworkType{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4, IsDns: false}
+	d1.MustGetLatencies10(networkType).AppendLatency(10 * time.Millisecond)
+	d2.MustGetLatencies10(networkType).AppendLatency(20 * time.Millisecond)
+	group := cp.outbounds[consts.OutboundUserDefinedMin]
+	group.MustGetAliveDialerSet(networkType).NotifyLatencyChange(d1, true)
+	group.MustGetAliveDialerSet(networkType).NotifyLatencyChange(d2, true)
+
+	_, err := cp.RouteDialTcp(context.Background(), newTestRouteDialParam())
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context canceled, got: %v", err)
+	}
+	if impl1.CallCount() != 1 {
+		t.Fatalf("unexpected dialer-1 call count: got=%d want=1", impl1.CallCount())
+	}
+	if impl2.CallCount() != 0 {
+		t.Fatalf("unexpected dialer-2 call count: got=%d want=0", impl2.CallCount())
+	}
+	if !d1.MustGetAlive(networkType) {
+		t.Fatal("dialer should not be marked unavailable on context canceled")
+	}
+}
