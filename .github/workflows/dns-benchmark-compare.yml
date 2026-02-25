@@ -183,9 +183,7 @@ jobs:
             local file="$1"
             [[ -f "$file" ]] || return 1
             awk '
-              /^name[[:space:]]+old[[:space:]]+time\/op/ {in_time=1; next}
-              in_time && /^$/ {in_time=0}
-              in_time && $1=="geomean" {print; exit}
+              $1=="geomean" {print; exit}
             ' "$file"
           }
 
