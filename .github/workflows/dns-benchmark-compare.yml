@@ -177,6 +177,37 @@ jobs:
           passed=0
           failed=0
           suite_lines=""
+          suite_delta_lines=""
+
+          extract_time_geomean_line() {
+            local file="$1"
+            [[ -f "$file" ]] || return 1
+            awk '
+              /^name[[:space:]]+old[[:space:]]+time\/op/ {in_time=1; next}
+              in_time && /^$/ {in_time=0}
+              in_time && $1=="geomean" {print; exit}
+            ' "$file"
+          }
+
+          suite_delta_summary() {
+            local suite="$1"
+            local benchstat_file="bench-artifacts/$suite/benchstat_common.txt"
+            local geomean_line old_v new_v delta_v
+            geomean_line="$(extract_time_geomean_line "$benchstat_file" || true)"
+            if [[ -z "$geomean_line" ]]; then
+              echo "- \`$suite\`: n/a (no common benchmark delta)"
+              return 0
+            fi
+
+            old_v="$(awk '{print $2}' <<<"$geomean_line")"
+            new_v="$(awk '{print $3}' <<<"$geomean_line")"
+            delta_v="$(grep -Eo '([+-][0-9]+(\.[0-9]+)?%|[+-]?Inf%)' <<<"$geomean_line" | head -n1 || true)"
+            [[ -z "$old_v" ]] && old_v="n/a"
+            [[ -z "$new_v" ]] && new_v="n/a"
+            [[ -z "$delta_v" ]] && delta_v="n/a"
+
+            echo "- \`$suite\`: \`$old_v -> $new_v\` (Δ \`$delta_v\`)"
+          }
 
           while IFS= read -r status_file; do
             suite="$(basename "$(dirname "$status_file")")"
@@ -189,6 +220,7 @@ jobs:
               failed=$((failed + 1))
               suite_lines+="- ❌ \`$suite\`: failed"$'\n'
             fi
+            suite_delta_lines+="$(suite_delta_summary "$suite")"$'\n'
           done < <(find bench-artifacts -mindepth 2 -maxdepth 2 -name status.txt | sort)
 
           overall="pass"
@@ -217,6 +249,14 @@ jobs:
               echo "- No suite status generated (benchmark setup failed early)."
             else
               printf "%s" "$suite_lines"
+            fi
+            echo
+            echo "### Suite Delta (time/op geomean)"
+            echo
+            if [[ "$total" -eq 0 ]]; then
+              echo "- No suite delta generated."
+            else
+              printf "%s" "$suite_delta_lines"
             fi
           } > "$PR_SUMMARY"
 
