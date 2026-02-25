@@ -287,6 +287,12 @@ group {
         #policy: min
 
         # Select the node with min moving average of latencies from the group for every connection.
+        #policy: min_moving_avg
+
+        # Smart policy: select by moving average + runtime failure penalty.
+        # Recommended when you want faster failover on transient dial failures.
+        #policy: smart
+
         policy: min_moving_avg
     }
 

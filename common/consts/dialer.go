@@ -30,6 +30,8 @@ const (
 	DialerSelectionPolicy_MinAverage10Latencies DialerSelectionPolicy = "min_avg10"
 	// DialerSelectionPolicy_MinMovingAverageLatencies selects the dialer with minimum moving average latency.
 	DialerSelectionPolicy_MinMovingAverageLatencies DialerSelectionPolicy = "min_moving_avg"
+	// DialerSelectionPolicy_Smart selects dialer by moving average latency and penalty score.
+	DialerSelectionPolicy_Smart DialerSelectionPolicy = "smart"
 	// DialerSelectionPolicy_MinLastLatency selects the dialer with minimum last latency.
 	DialerSelectionPolicy_MinLastLatency DialerSelectionPolicy = "min"
 )
