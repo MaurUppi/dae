@@ -81,9 +81,11 @@ type ControlPlane struct {
 	realDomainNegSet  sync.Map // map[string]int64 (expiresAt unix nano)
 	dnsDialerSnapshot sync.Map // map[dnsDialerSnapshotKey]*dnsDialerSnapshotEntry
 	realDomainProbeS  singleflight.Group
-	negJanitorStop    chan struct{}
-	negJanitorDone    chan struct{}
-	negJanitorOnce    sync.Once
+	// key: dst addr:port, value: *tupleMissCounter
+	shortLivedTupleMissCounters sync.Map
+	negJanitorStop              chan struct{}
+	negJanitorDone              chan struct{}
+	negJanitorOnce              sync.Once
 
 	wanInterface []string
 	lanInterface []string
@@ -1136,17 +1138,32 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 					rr, retrieveErr := c.core.RetrieveRoutingResult(convergeSrc, realDst, unix.IPPROTO_UDP)
 					if retrieveErr != nil {
 						if errors.Is(retrieveErr, ebpf.ErrKeyNotExist) {
-							// Keep behavior consistent with TCP path: missing tuple can happen
-							// in short race windows; fallback to userspace routing instead of
-							// dropping the packet.
+							// Graceful fallback: for short-lived UDP traffic, tuple cache misses
+							// are expected because eBPF intentionally skips map writes to avoid
+							// map bloat; userspace routing handles the packet.
 							routingResult = &bpfRoutingResult{
 								Outbound: uint8(consts.OutboundControlPlaneRouting),
 							}
 							if c.log.IsLevelEnabled(logrus.DebugLevel) {
-								c.log.WithFields(logrus.Fields{
-									"src": convergeSrc.String(),
-									"dst": realDst.String(),
-								}).WithError(retrieveErr).Debug("UDP routing tuple missing; fallback to userspace routing")
+								if isShortLivedUDPPort(realDst.Port()) {
+									emit, count := c.recordShortLivedTupleMiss(realDst)
+									if emit {
+										fields := logrus.Fields{
+											"dst": realDst.String(),
+										}
+										if count == 1 {
+											fields["src"] = convergeSrc.String()
+											c.log.WithFields(fields).WithError(retrieveErr).Debug("UDP routing tuple missing; short-lived UDP fast path fallback")
+										} else {
+											c.log.WithFields(fields).Debug(shortLivedTupleMissSummaryMsg(count))
+										}
+									}
+								} else {
+									c.log.WithFields(logrus.Fields{
+										"src": convergeSrc.String(),
+										"dst": realDst.String(),
+									}).WithError(retrieveErr).Debug("UDP routing tuple missing; fallback to userspace routing")
+								}
 							}
 						} else {
 							c.log.Warnf("No AddrPort presented: %v", retrieveErr)
