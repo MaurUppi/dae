@@ -57,6 +57,33 @@ func ChooseNatTimeout(data []byte, sniffDns bool) (dmsg *dnsmessage.Msg, timeout
 	return nil, DefaultNatTimeout
 }
 
+func (c *ControlPlane) handleFastPathWriteFailure(realSrc, realDst netip.AddrPort, ue *UdpEndpoint, domain string, writeErr error) error {
+	debugEnabled := c != nil && c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel)
+	if debugEnabled {
+		fields := logrus.Fields{
+			"src":     realSrc.String(),
+			"dst":     realDst.String(),
+			"sniffed": domain,
+			"dead":    ue.IsDead(),
+			"err":     writeErr.Error(),
+		}
+		if ue.Outbound != nil {
+			fields["outbound"] = ue.Outbound.Name
+		}
+		if ue.Dialer != nil {
+			fields["dialer"] = ue.Dialer.Property().Name
+		}
+		c.log.WithFields(fields).Debugln("QUIC fast-path write failed")
+	}
+	if rmErr := DefaultUdpEndpointPool.Remove(realSrc, ue); rmErr != nil && debugEnabled {
+		c.log.WithError(rmErr).WithFields(logrus.Fields{
+			"src": realSrc.String(),
+			"dst": realDst.String(),
+		}).Debugln("Failed to remove UDP endpoint after fast-path write failure")
+	}
+	return fmt.Errorf("quic-fp: write udp packet request: %w", writeErr)
+}
+
 // sendPkt uses bind first, and fallback to send hdr if addr is in use.
 func sendPkt(log *logrus.Logger, data []byte, from netip.AddrPort, realTo, to netip.AddrPort, lConn *net.UDPConn) (err error) {
 	uConn, _, err := DefaultAnyfromPool.GetOrCreate(from, AnyfromTimeout)
@@ -129,23 +156,7 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 
 		_, err = ue.WriteTo(data, dialTarget)
 		if err != nil {
-			if c.log.IsLevelEnabled(logrus.DebugLevel) {
-				fields := logrus.Fields{
-					"src":     realSrc.String(),
-					"dst":     realDst.String(),
-					"sniffed": domain,
-					"dead":    ue.IsDead(),
-					"err":     err.Error(),
-				}
-				if ue.Outbound != nil {
-					fields["outbound"] = ue.Outbound.Name
-				}
-				if ue.Dialer != nil {
-					fields["dialer"] = ue.Dialer.Property().Name
-				}
-				c.log.WithFields(fields).Debugln("QUIC fast-path write failed")
-			}
-			return fmt.Errorf("quic-fp: write udp packet request: %w", err)
+			return c.handleFastPathWriteFailure(realSrc, realDst, ue, domain, err)
 		}
 		return nil
 	}
