@@ -1,0 +1,295 @@
+name: DNS Benchmark Compare
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "control/**"
+      - "component/dns/**"
+      - "go.mod"
+      - "go.sum"
+      - "scripts/ci/dns-benchmark-compare.sh"
+      - "scripts/ci/dns-benchmark-suite-runner.sh"
+      - "scripts/ci/dns-benchmark-suites.sh"
+      - "scripts/ci/benchmarks/**"
+      - ".github/workflows/dns-benchmark-compare.yml"
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: "Base ref for merge-base (for example: origin/main)"
+        required: false
+        default: "origin/main"
+      head_ref:
+        description: "Head ref to benchmark"
+        required: false
+        default: "HEAD"
+      base_strategy:
+        description: "Base commit strategy: merge-base or exact"
+        required: false
+        default: "merge-base"
+      suite_profile:
+        description: "Suite profile: quick or dns-module"
+        required: false
+        default: "dns-module"
+      suite_list:
+        description: "Optional comma-separated suite list. Overrides profile."
+        required: false
+        default: ""
+      bench_count:
+        description: "go test -count"
+        required: false
+        default: "3"
+      bench_time:
+        description: "go test -benchtime"
+        required: false
+        default: "200ms"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  bench-compare:
+    name: DNS Bench Compare
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: recursive
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.mod
+            go.sum
+
+      - name: Install Dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang llvm make
+
+      - name: Install benchstat
+        run: |
+          GOTOOLCHAIN=auto go install golang.org/x/perf/cmd/benchstat@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Run Benchmark Compare
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci/dns-benchmark-compare.sh
+          chmod +x scripts/ci/dns-benchmark-suite-runner.sh
+          mkdir -p bench-artifacts
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE_REF="origin/${{ github.base_ref }}"
+            HEAD_REF="${{ github.sha }}"
+            BASE_STRATEGY="merge-base"
+            SUITE_PROFILE="dns-module"
+            SUITE_LIST=""
+            BENCH_COUNT="3"
+            BENCH_TIME="200ms"
+          else
+            BASE_REF="${{ github.event.inputs.base_ref }}"
+            HEAD_REF="${{ github.event.inputs.head_ref }}"
+            BASE_STRATEGY="${{ github.event.inputs.base_strategy }}"
+            SUITE_PROFILE="${{ github.event.inputs.suite_profile }}"
+            SUITE_LIST="${{ github.event.inputs.suite_list }}"
+            BENCH_COUNT="${{ github.event.inputs.bench_count }}"
+            BENCH_TIME="${{ github.event.inputs.bench_time }}"
+          fi
+
+          {
+            echo "BASE_REF=$BASE_REF"
+            echo "HEAD_REF=$HEAD_REF"
+            echo "BASE_STRATEGY=$BASE_STRATEGY"
+            echo "SUITE_PROFILE=$SUITE_PROFILE"
+            echo "SUITE_LIST=$SUITE_LIST"
+            echo "BENCH_COUNT=$BENCH_COUNT"
+            echo "BENCH_TIME=$BENCH_TIME"
+          } > bench-artifacts/meta.env
+
+          set +e
+          DNS_BENCH_PROFILE="$SUITE_PROFILE" \
+          DNS_BENCH_SUITES="$SUITE_LIST" \
+          BENCH_COUNT="$BENCH_COUNT" \
+          BENCH_TIME="$BENCH_TIME" \
+          BASE_COMMIT_STRATEGY="$BASE_STRATEGY" \
+          ARTIFACT_DIR="$PWD/bench-artifacts" \
+          ./scripts/ci/dns-benchmark-suite-runner.sh "$BASE_REF" "$HEAD_REF" \
+            2>&1 | tee bench-artifacts/run.log
+          status=${PIPESTATUS[0]}
+          set -e
+
+          if [[ $status -ne 0 && ! -f bench-artifacts/report.md ]]; then
+            {
+              echo "## DNS Benchmark Compare"
+              echo
+              echo "- Status: failed"
+              echo "- Exit code: \`$status\`"
+              echo "- Base ref: \`$BASE_REF\`"
+              echo "- Head ref: \`$HEAD_REF\`"
+              echo "- Base strategy: \`$BASE_STRATEGY\`"
+              echo "- Suite profile: \`$SUITE_PROFILE\`"
+              if [[ -n "$SUITE_LIST" ]]; then
+                echo "- Suite selection: \`$SUITE_LIST\`"
+              fi
+              echo
+              echo "### Failure Log (tail)"
+              echo
+              echo '```text'
+              tail -n 200 bench-artifacts/run.log || true
+              echo '```'
+            } > bench-artifacts/report.md
+          fi
+          exit $status
+
+      - name: Upload Benchmark Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dns-benchmark-compare-${{ github.run_id }}
+          path: bench-artifacts
+          if-no-files-found: warn
+
+      - name: Build PR Summary
+        if: always() && github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PR_SUMMARY="bench-artifacts/pr-summary.md"
+          META_FILE="bench-artifacts/meta.env"
+          if [[ ! -f "$META_FILE" ]]; then
+            exit 0
+          fi
+
+          # shellcheck disable=SC1090
+          source "$META_FILE"
+
+          total=0
+          passed=0
+          failed=0
+          suite_lines=""
+          suite_delta_lines=""
+
+          extract_time_geomean_line() {
+            local file="$1"
+            [[ -f "$file" ]] || return 1
+            awk '
+              $1=="geomean" {print; exit}
+            ' "$file"
+          }
+
+          suite_delta_summary() {
+            local suite="$1"
+            local benchstat_file="bench-artifacts/$suite/benchstat_common.txt"
+            local geomean_line old_v new_v delta_v
+            geomean_line="$(extract_time_geomean_line "$benchstat_file" || true)"
+            if [[ -z "$geomean_line" ]]; then
+              echo "- \`$suite\`: n/a (no common benchmark delta)"
+              return 0
+            fi
+
+            old_v="$(awk '{print $2}' <<<"$geomean_line")"
+            new_v="$(awk '{print $3}' <<<"$geomean_line")"
+            delta_v="$(grep -Eo '([+-][0-9]+(\.[0-9]+)?%|[+-]?Inf%)' <<<"$geomean_line" | head -n1 || true)"
+            [[ -z "$old_v" ]] && old_v="n/a"
+            [[ -z "$new_v" ]] && new_v="n/a"
+            [[ -z "$delta_v" ]] && delta_v="n/a"
+
+            echo "- \`$suite\`: \`$old_v -> $new_v\` (Δ \`$delta_v\`)"
+          }
+
+          while IFS= read -r status_file; do
+            suite="$(basename "$(dirname "$status_file")")"
+            status="$(cat "$status_file" 2>/dev/null || echo 1)"
+            total=$((total + 1))
+            if [[ "$status" == "0" ]]; then
+              passed=$((passed + 1))
+              suite_lines+="- ✅ \`$suite\`: pass"$'\n'
+            else
+              failed=$((failed + 1))
+              suite_lines+="- ❌ \`$suite\`: failed"$'\n'
+            fi
+            suite_delta_lines+="$(suite_delta_summary "$suite")"$'\n'
+          done < <(find bench-artifacts -mindepth 2 -maxdepth 2 -name status.txt | sort)
+
+          overall="pass"
+          if [[ "$failed" -gt 0 || "$total" -eq 0 ]]; then
+            overall="not pass"
+          fi
+
+          {
+            echo "## DNS Benchmark Compare Summary"
+            echo
+            echo "- Before (base): \`$BASE_REF\`"
+            echo "- After (head): \`$HEAD_REF\`"
+            echo "- Base strategy: \`$BASE_STRATEGY\`"
+            if [[ -n "$SUITE_LIST" ]]; then
+              echo "- Suite selection: \`$SUITE_LIST\`"
+            else
+              echo "- Suite profile: \`$SUITE_PROFILE\`"
+            fi
+            echo "- Overall: **$overall** ($passed/$total passed)"
+            echo "- Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Full report artifact: \`dns-benchmark-compare-${{ github.run_id }}\`"
+            echo
+            echo "### Suite Status"
+            echo
+            if [[ "$total" -eq 0 ]]; then
+              echo "- No suite status generated (benchmark setup failed early)."
+            else
+              printf "%s" "$suite_lines"
+            fi
+            echo
+            echo "### Suite Delta (time/op geomean)"
+            echo
+            if [[ "$total" -eq 0 ]]; then
+              echo "- No suite delta generated."
+            else
+              printf "%s" "$suite_delta_lines"
+            fi
+          } > "$PR_SUMMARY"
+
+      - name: Update PR Comment
+        if: always() && github.event_name == 'pull_request' && hashFiles('bench-artifacts/pr-summary.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const marker = "<!-- dae-dns-benchmark-compare -->";
+            const report = fs.readFileSync("bench-artifacts/pr-summary.md", "utf8");
+            const body = `${marker}\n${report}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100
+            });
+
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body
+              });
+            }

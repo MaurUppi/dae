@@ -2,96 +2,10 @@ package control
 
 import (
 	"errors"
-	"io"
 	"os"
-	"sync"
 	"testing"
 	"time"
-
-	"github.com/daeuniverse/outbound/netproxy"
 )
-
-// Ensure mockConn implements netproxy.Conn
-var _ netproxy.Conn = (*mockConn)(nil)
-
-// Mock connection implementing netproxy.Conn
-type mockConn struct {
-	readBlock  chan struct{}
-	readRetErr error
-	deadline   time.Time
-	mu         sync.Mutex
-	once       sync.Once
-	closed     bool
-}
-
-func newMockConn(block bool, retErr error) *mockConn {
-	m := &mockConn{
-		readBlock:  make(chan struct{}),
-		readRetErr: retErr,
-	}
-	if !block {
-		m.once.Do(func() {
-			close(m.readBlock)
-		})
-	}
-	return m
-}
-
-func (m *mockConn) Read(b []byte) (n int, err error) {
-	if m.closed {
-		return 0, io.EOF
-	}
-	<-m.readBlock
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	// Check if deadline triggered
-	if !m.deadline.IsZero() && m.deadline.Before(time.Now()) {
-		return 0, os.ErrDeadlineExceeded
-	}
-
-	if m.readRetErr != nil {
-		return 0, m.readRetErr
-	}
-	return 0, io.EOF
-}
-
-func (m *mockConn) Write(b []byte) (n int, err error) {
-	return len(b), nil
-}
-
-func (m *mockConn) Close() error {
-	m.closed = true
-	return nil
-}
-
-func (m *mockConn) SetDeadline(t time.Time) error {
-	return m.SetReadDeadline(t)
-}
-
-func (m *mockConn) SetReadDeadline(t time.Time) error {
-	m.mu.Lock()
-	m.deadline = t
-	m.mu.Unlock()
-
-	// If deadline is in the past, unblock Read
-	if !t.IsZero() && t.Before(time.Now()) {
-		m.once.Do(func() {
-			close(m.readBlock)
-		})
-	}
-	return nil
-}
-
-func (m *mockConn) SetWriteDeadline(t time.Time) error {
-	return nil
-}
-
-// Satisfy WriteCloser interface check in RelayTCP
-func (m *mockConn) CloseWrite() error {
-	return nil
-}
 
 func TestRelayTCP_Cancellation(t *testing.T) {
 	// Scenario:

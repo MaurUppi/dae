@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"math"
 	"testing"
 	"time"
 
@@ -265,5 +266,130 @@ func TestDialerCheck_MixedDialersNoCascadeOnSkip(t *testing.T) {
 	}
 	if selected != d2 {
 		t.Fatalf("expected alive dialer to be d2, got %s", selected.Property().Name)
+	}
+}
+func TestDialerCheck_Counters(t *testing.T) {
+	d := newTestDialer(t)
+	networkType := newTestNetworkType()
+
+	if _, err := d.Check(&CheckOption{
+		networkType: networkType,
+		CheckFunc: func(context.Context, *NetworkType) (bool, error) {
+			return true, nil
+		},
+	}); err != nil {
+		t.Fatalf("unexpected success check error: %v", err)
+	}
+
+	if _, err := d.Check(&CheckOption{
+		networkType: networkType,
+		CheckFunc: func(context.Context, *NetworkType) (bool, error) {
+			return false, nil
+		},
+	}); err != nil {
+		t.Fatalf("unexpected skip check error: %v", err)
+	}
+
+	if _, err := d.Check(&CheckOption{
+		networkType: networkType,
+		CheckFunc: func(context.Context, *NetworkType) (bool, error) {
+			return false, errors.New("failed")
+		},
+	}); err == nil {
+		t.Fatal("expected failure check error")
+	}
+
+	checkTotal, checkFailureTotal := d.GetCollectionCounters(networkType)
+	if checkTotal != 3 {
+		t.Fatalf("unexpected check total: got=%d want=3", checkTotal)
+	}
+	if checkFailureTotal != 1 {
+		t.Fatalf("unexpected check failure total: got=%d want=1", checkFailureTotal)
+	}
+}
+func TestDialerLogUnavailable_AsymmetricEMAAndPenalty(t *testing.T) {
+	d := newTestDialer(t)
+	networkType := newTestNetworkType()
+	col := d.mustGetCollection(networkType)
+	col.MovingAverage = 100 * time.Millisecond
+
+	d.logUnavailable(col, networkType, errors.New("dial failure #1"))
+	wantMA1 := time.Duration(float64(100*time.Millisecond)*(1-emaAlphaPenalty) + float64(Timeout)*emaAlphaPenalty)
+	if col.MovingAverage != wantMA1 {
+		t.Fatalf("unexpected moving average after first failure: got=%v want=%v", col.MovingAverage, wantMA1)
+	}
+	if col.ConsecutiveFailures != 1 {
+		t.Fatalf("unexpected consecutive failures after first failure: got=%d want=1", col.ConsecutiveFailures)
+	}
+	if col.PenaltyPoints != 1.0 {
+		t.Fatalf("unexpected penalty points after first failure: got=%.2f want=1.0", col.PenaltyPoints)
+	}
+
+	d.logUnavailable(col, networkType, errors.New("dial failure #2"))
+	wantMA2 := time.Duration(float64(wantMA1)*(1-emaAlphaPenalty) + float64(Timeout)*emaAlphaPenalty)
+	if col.MovingAverage != wantMA2 {
+		t.Fatalf("unexpected moving average after second failure: got=%v want=%v", col.MovingAverage, wantMA2)
+	}
+	if col.ConsecutiveFailures != 2 {
+		t.Fatalf("unexpected consecutive failures after second failure: got=%d want=2", col.ConsecutiveFailures)
+	}
+	if col.PenaltyPoints != 3.0 {
+		t.Fatalf("unexpected penalty points after second failure: got=%.2f want=3.0", col.PenaltyPoints)
+	}
+}
+
+func TestDialerLogUnavailable_PenaltyCap(t *testing.T) {
+	d := newTestDialer(t)
+	networkType := newTestNetworkType()
+	col := d.mustGetCollection(networkType)
+
+	for i := 0; i < 32; i++ {
+		d.logUnavailable(col, networkType, errors.New("dial failure"))
+	}
+	if col.PenaltyPoints > maxPenaltyPoints {
+		t.Fatalf("penalty points should be capped: got=%.2f cap=%.2f", col.PenaltyPoints, maxPenaltyPoints)
+	}
+	if col.PenaltyPoints != maxPenaltyPoints {
+		t.Fatalf("unexpected capped penalty points: got=%.2f want=%.2f", col.PenaltyPoints, maxPenaltyPoints)
+	}
+}
+
+func TestDialerCheck_SuccessRecoveryAndPenaltyDecay(t *testing.T) {
+	d := newTestDialer(t)
+	networkType := newTestNetworkType()
+	col := d.mustGetCollection(networkType)
+
+	col.MovingAverage = 5 * time.Second
+	col.PenaltyPoints = 10.0
+	col.ConsecutiveFailures = 3
+
+	ok, err := d.Check(&CheckOption{
+		networkType: networkType,
+		CheckFunc: func(context.Context, *NetworkType) (bool, error) {
+			return true, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("unexpected success check error: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected ok=true")
+	}
+
+	lastLatency, has := col.Latencies10.LastLatency()
+	if !has {
+		t.Fatal("expected last latency sample on success")
+	}
+	wantMA := time.Duration(
+		float64(5*time.Second)*(1-emaAlphaRecovery) + float64(lastLatency)*emaAlphaRecovery,
+	)
+	if col.MovingAverage != wantMA {
+		t.Fatalf("unexpected moving average after success: got=%v want=%v", col.MovingAverage, wantMA)
+	}
+	if col.ConsecutiveFailures != 0 {
+		t.Fatalf("expected consecutive failures reset to 0, got=%d", col.ConsecutiveFailures)
+	}
+	if math.Abs(col.PenaltyPoints-7.0) > 1e-9 {
+		t.Fatalf("unexpected penalty decay: got=%.10f want=7.0", col.PenaltyPoints)
 	}
 }

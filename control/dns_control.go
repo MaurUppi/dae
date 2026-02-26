@@ -106,6 +106,16 @@ type DnsController struct {
 	dnsForwarderCache sync.Map // map[dnsForwarderKey]*cachedDnsForwarder
 	sf                singleflight.Group
 
+	dnsMetricsInit       sync.Once
+	dnsQueryTotal        atomic.Uint64
+	dnsCacheHitTotal     atomic.Uint64
+	dnsCacheLazyHitTotal atomic.Uint64
+	dnsCacheMissTotal    atomic.Uint64
+	dnsRejectedTotal     atomic.Uint64
+	dnsRefusedTotal      atomic.Uint64
+	dnsResponseLatency   *dnsLatencyHistogram
+	dnsUpstreamMetrics   sync.Map // map[string]*dnsUpstreamMetric
+
 	janitorStop chan struct{}
 	janitorDone chan struct{}
 	evictorDone chan struct{}
@@ -215,9 +225,10 @@ func NewDnsController(routing *dns.Dns, option *DnsControllerOption) (c *DnsCont
 		bestDialerChooser:     option.BestDialerChooser,
 		timeoutExceedCallback: option.TimeoutExceedCallback,
 
-		fixedDomainTtl:    option.FixedDomainTtl,
-		dnsCache:          sync.Map{},
-		dnsForwarderCache: sync.Map{},
+		fixedDomainTtl:     option.FixedDomainTtl,
+		dnsCache:           sync.Map{},
+		dnsForwarderCache:  sync.Map{},
+		dnsResponseLatency: newDnsLatencyHistogram(),
 
 		janitorStop: make(chan struct{}),
 		janitorDone: make(chan struct{}),
@@ -302,6 +313,42 @@ func (c *DnsController) cacheKey(qname string, qtype uint16) string {
 	}
 	// Slow path: fallback to strconv for uncommon types
 	return qname + strconv.Itoa(int(qtype))
+}
+
+func (c *DnsController) CacheSize() int {
+	count := 0
+	c.dnsCache.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	return count
+}
+
+func (c *DnsController) ConcurrencyInfo() (inUse, limit int) {
+	limit = cap(c.concurrencyLimiter)
+	if limit == 0 {
+		return 0, 0
+	}
+	inUse = len(c.concurrencyLimiter)
+	return
+}
+
+func (c *DnsController) ForwarderCacheInfo() (count int, inFlightByUpstream map[string]int32) {
+	inFlightByUpstream = make(map[string]int32)
+	c.dnsForwarderCache.Range(func(key, value interface{}) bool {
+		count++
+		k, ok := key.(dnsForwarderKey)
+		if !ok {
+			return true
+		}
+		entry, ok := value.(*cachedDnsForwarder)
+		if !ok {
+			return true
+		}
+		inFlightByUpstream[k.upstream] += entry.inFlight.Load()
+		return true
+	})
+	return
 }
 
 func (c *DnsController) RemoveDnsRespCache(cacheKey string) {
@@ -557,11 +604,11 @@ func (c *DnsController) evictLRUIfFull(now time.Time) {
 			// Swap root (minimum) with last element
 			lastIdx := len(entries) - 1 - i
 			entries[0], entries[lastIdx] = entries[lastIdx], entries[0]
-			
+
 			// Restore heap property for remaining elements
 			heapifyMin(entries, 0, lastIdx)
 		}
-		
+
 		// The k oldest are now at the end of entries (indices len-n to len-1)
 		entries = entries[len(entries)-numToEvict:]
 	}
@@ -1061,8 +1108,20 @@ func (c *DnsController) getOrCreateDnsForwarder(upstream *dns.Upstream, dialArg 
 }
 
 func (c *DnsController) forwardWithDialArg(ctx context.Context, upstream *dns.Upstream, dialArg *dialArgument, data []byte) (*dnsmessage.Msg, error) {
+	upstreamName := "<nil>"
+	if upstream != nil {
+		upstreamName = upstream.String()
+	}
+	upstreamMetric := c.getOrCreateDnsUpstreamMetric(upstreamName)
+	upstreamMetric.queryTotal.Add(1)
+	start := time.Now()
+	defer func() {
+		upstreamMetric.latency.Observe(time.Since(start).Seconds())
+	}()
+
 	entry, err := c.getOrCreateDnsForwarder(upstream, dialArg)
 	if err != nil {
+		upstreamMetric.errTotal.Add(1)
 		return nil, err
 	}
 	entry.beginUse()
@@ -1070,6 +1129,7 @@ func (c *DnsController) forwardWithDialArg(ctx context.Context, upstream *dns.Up
 
 	respMsg, err := entry.forwarder.ForwardDNS(ctx, data)
 	if err != nil {
+		upstreamMetric.errTotal.Add(1)
 		c.reportDnsForwardFailure(dialArg, err)
 		return nil, err
 	}
@@ -1128,6 +1188,12 @@ func (c *DnsController) Handle_(ctx context.Context, dnsMessage *dnsmessage.Msg,
 }
 
 func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
+	c.dnsQueryTotal.Add(1)
+	start := time.Now()
+	defer func() {
+		c.observeDnsResponseLatency(time.Since(start))
+	}()
+
 	// Try to acquire semaphore (skip if unlimited)
 	if cap(c.concurrencyLimiter) > 0 {
 		select {
@@ -1175,6 +1241,11 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 
 		// Check cache after routing (non-reject case)
 		if resp, needRefresh := c.LookupDnsRespCache_(dnsMessage, cacheKey, false); resp != nil {
+			if needRefresh {
+				c.dnsCacheLazyHitTotal.Add(1)
+			} else {
+				c.dnsCacheHitTotal.Add(1)
+			}
 			// Cache hit - return immediately without singleflight
 			// OPTIMISTIC CACHE: resp may be stale, trigger background refresh if needed
 			if needRefresh {
@@ -1200,6 +1271,7 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 			}
 			return nil
 		}
+		c.dnsCacheMissTotal.Add(1)
 
 		// Cache miss - use singleflight to coalesce concurrent requests
 		// This prevents thundering herd on upstream DNS servers
@@ -1522,6 +1594,8 @@ func (c *DnsController) writeCachedResponse(resp []byte, reqId uint16, req *udpR
 
 // sendRefusedWithResponseWriter_ sends REFUSED response when overload protection is triggered.
 func (c *DnsController) sendRefusedWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
+	c.dnsRefusedTotal.Add(1)
+
 	dnsMessage.Answer = nil
 	dnsMessage.Rcode = dnsmessage.RcodeRefused
 	dnsMessage.Response = true
@@ -1554,6 +1628,8 @@ func (c *DnsController) sendRefusedWithResponseWriter_(dnsMessage *dnsmessage.Ms
 
 // sendRejectWithResponseWriter_ send empty answer using response writer.
 func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
+	c.dnsRejectedTotal.Add(1)
+
 	dnsMessage.Answer = nil
 	dnsMessage.Rcode = dnsmessage.RcodeSuccess
 	dnsMessage.Response = true
@@ -1698,14 +1774,15 @@ func (c *DnsController) dialSend(ctx context.Context, invokingDepth int, req *ud
 	// OPTIMIZATION: Send response first, then cache asynchronously.
 	// This reduces client-perceived latency, especially important for:
 	// 1. High QPS scenarios where cache operations accumulate
-	// 2. Proxy chains with already high latency
-	//
-	// Cache operations (~260ns + BPF update) are negligible compared to
-	// network latency (1-2s), but doing them async is still beneficial:
-	// - Reduces tail latency under load
-	// - Follows "respond first, process later" best practice
-	//
-	// Trade-off: If caching fails, the response is still valid but won't be cached.
+		// 2. Proxy chains with already high latency
+		//
+		// Cache operations (~260ns + BPF update) are negligible compared to
+		// network latency (1-2s), but doing them async is still beneficial:
+		// - Reduces tail latency under load
+		// - Follows "respond first, process later" best practice
+		//
+		//
+		// Trade-off: If caching fails, the response is still valid but won't be cached.
 	// This is acceptable because:
 	// - Cache failures are rare
 	// - The response is already sent to the client

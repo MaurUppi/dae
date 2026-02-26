@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/netip"
@@ -18,6 +19,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unsafe"
 
@@ -34,7 +36,17 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-const Timeout = 10 * time.Second
+const (
+	Timeout = 10 * time.Second
+
+	emaAlphaPenalty  = 0.5
+	emaAlphaRecovery = 0.3
+
+	basePenalty       = 1.0
+	maxPenaltyPoints  = 50.0
+	maxConsecutiveCap = 5
+	successDecayRate  = 0.7
+)
 
 type NetworkType struct {
 	L4Proto   consts.L4ProtoStr
@@ -56,10 +68,14 @@ func (t *NetworkType) StringWithoutDns() string {
 
 type collection struct {
 	// AliveDialerSetSet uses reference counting.
-	AliveDialerSetSet AliveDialerSetSet
-	Latencies10       *LatenciesN
-	MovingAverage     time.Duration
-	Alive             bool
+	AliveDialerSetSet   AliveDialerSetSet
+	Latencies10         *LatenciesN
+	MovingAverage       time.Duration
+	PenaltyPoints       float64
+	ConsecutiveFailures int
+	Alive               bool
+	CheckTotal          atomic.Uint64
+	CheckFailureTotal   atomic.Uint64
 }
 
 func newCollection() *collection {
@@ -543,6 +559,22 @@ func (d *Dialer) MustGetLatencies10(typ *NetworkType) *LatenciesN {
 	return d.mustGetCollection(typ).Latencies10
 }
 
+// GetCollectionState returns a snapshot of the dialer's health state for the given network type.
+func (d *Dialer) GetCollectionState(typ *NetworkType) (alive bool, lastLatency, avg10, movingAvg time.Duration) {
+	d.collectionFineMu.Lock()
+	col := d.mustGetCollection(typ)
+	alive = col.Alive
+	movingAvg = col.MovingAverage
+	d.collectionFineMu.Unlock()
+	lastLatency, _ = col.Latencies10.LastLatency()
+	avg10, _ = col.Latencies10.AvgLatency()
+	return
+}
+func (d *Dialer) GetCollectionCounters(typ *NetworkType) (checkTotal, checkFailureTotal uint64) {
+	col := d.mustGetCollection(typ)
+	return col.CheckTotal.Load(), col.CheckFailureTotal.Load()
+}
+
 // RegisterAliveDialerSet is thread-safe.
 func (d *Dialer) RegisterAliveDialerSet(a *AliveDialerSet) {
 	if a == nil {
@@ -587,8 +619,19 @@ func (d *Dialer) logUnavailable(
 		}).Debugln("Connectivity Check Failed")
 	}
 	collection.Latencies10.AppendLatency(Timeout)
-	collection.MovingAverage = (collection.MovingAverage + Timeout) / 2
+	collection.MovingAverage = time.Duration(
+		float64(collection.MovingAverage)*(1-emaAlphaPenalty) + float64(Timeout)*emaAlphaPenalty,
+	)
 	collection.Alive = false
+	collection.ConsecutiveFailures++
+	exponent := collection.ConsecutiveFailures
+	if exponent > maxConsecutiveCap {
+		exponent = maxConsecutiveCap
+	}
+	collection.PenaltyPoints += basePenalty * math.Pow(2, float64(exponent-1))
+	if collection.PenaltyPoints > maxPenaltyPoints {
+		collection.PenaltyPoints = maxPenaltyPoints
+	}
 }
 
 func (d *Dialer) informDialerGroupUpdate(collection *collection) {
@@ -613,6 +656,7 @@ func (d *Dialer) Check(opts *CheckOption) (ok bool, err error) {
 	start := time.Now()
 	// Calc latency.
 	collection := d.mustGetCollection(opts.networkType)
+	collection.CheckTotal.Add(1)
 	ok, err = opts.CheckFunc(ctx, opts.networkType)
 	if ok && err == nil {
 		// Success: update latency and mark alive.
@@ -622,11 +666,15 @@ func (d *Dialer) Check(opts *CheckOption) (ok bool, err error) {
 		d.collectionFineMu.Lock()
 		collection.Latencies10.AppendLatency(latency)
 		avg, _ := collection.Latencies10.AvgLatency()
-		collection.MovingAverage = (collection.MovingAverage + latency) / 2
-		collection.Alive = true
-		d.collectionFineMu.Unlock()
+			collection.MovingAverage = time.Duration(
+				float64(collection.MovingAverage)*(1-emaAlphaRecovery) + float64(latency)*emaAlphaRecovery,
+			)
+			collection.Alive = true
+			collection.ConsecutiveFailures = 0
+			collection.PenaltyPoints *= successDecayRate
+			d.collectionFineMu.Unlock()
 
-		d.Log.WithFields(logrus.Fields{
+			d.Log.WithFields(logrus.Fields{
 			"network": opts.networkType.String(),
 			"node":    d.property.Name,
 			"last":    latency.Truncate(time.Millisecond).String(),
@@ -636,6 +684,7 @@ func (d *Dialer) Check(opts *CheckOption) (ok bool, err error) {
 		d.informDialerGroupUpdate(collection)
 	} else if err != nil {
 		// Failure: mark unavailable only if there's an actual error.
+		collection.CheckFailureTotal.Add(1)
 		d.logUnavailable(collection, opts.networkType, err)
 		d.informDialerGroupUpdate(collection)
 	}

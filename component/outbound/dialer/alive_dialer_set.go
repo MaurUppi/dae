@@ -7,6 +7,7 @@ package dialer
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -102,6 +103,12 @@ func (a *AliveDialerSet) GetRand() *Dialer {
 	return a.inorderedAliveDialerSet[ind]
 }
 
+func (a *AliveDialerSet) AliveCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.inorderedAliveDialerSet)
+}
+
 func (a *AliveDialerSet) SortingLatency(d *Dialer) time.Duration {
 	return a.dialerToLatency[d] + a.dialerToLatencyOffset[d]
 }
@@ -109,6 +116,33 @@ func (a *AliveDialerSet) SortingLatency(d *Dialer) time.Duration {
 // GetMinLatency acquires correct selectionPolicy.
 func (a *AliveDialerSet) GetMinLatency() (d *Dialer, latency time.Duration) {
 	return a.minLatency.dialer, a.minLatency.sortingLatency
+}
+
+func (a *AliveDialerSet) GetSmartBest() (*Dialer, time.Duration) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if len(a.inorderedAliveDialerSet) == 0 {
+		return nil, 0
+	}
+	var bestDialer *Dialer
+	bestScore := time.Duration(math.MaxInt64)
+	for _, d := range a.inorderedAliveDialerSet {
+		rawLatency, ok := a.dialerToLatency[d]
+		if !ok {
+			continue
+		}
+		sortingLatency := rawLatency + a.dialerToLatencyOffset[d]
+		col := d.mustGetCollection(a.CheckTyp)
+		score := time.Duration(float64(sortingLatency) * (1 + col.PenaltyPoints))
+		if bestDialer == nil || score < bestScore {
+			bestDialer = d
+			bestScore = score
+		}
+	}
+	if bestDialer == nil {
+		return nil, 0
+	}
+	return bestDialer, bestScore
 }
 
 func (a *AliveDialerSet) printLatencies() {
@@ -159,6 +193,10 @@ func (a *AliveDialerSet) NotifyLatencyChange(dialer *Dialer, alive bool) {
 		rawLatency, hasLatency = dialer.mustGetCollection(a.CheckTyp).Latencies10.AvgLatency()
 		minPolicy = true
 	case consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+		rawLatency = dialer.mustGetCollection(a.CheckTyp).MovingAverage
+		hasLatency = rawLatency > 0
+		minPolicy = true
+	case consts.DialerSelectionPolicy_Smart:
 		rawLatency = dialer.mustGetCollection(a.CheckTyp).MovingAverage
 		hasLatency = rawLatency > 0
 		minPolicy = true

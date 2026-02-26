@@ -159,20 +159,20 @@ func (q *UdpTaskQueue) convoy() {
 				q.safeTimerReset(timer)
 				continue
 			}
-			
+
 			// Set draining flag to prevent new acquisitions
 			q.draining.Store(true)
-			
+
 			// Brief wait for in-flight acquireQueue calls to complete
 			time.Sleep(10 * time.Millisecond)
-			
+
 			// Final check: ensure no new tasks arrived
 			if q.refs.Load() > 0 || len(q.ch) > 0 || q.overflowLen.Load() > 0 {
 				q.draining.Store(false)
 				q.safeTimerReset(timer)
 				continue
 			}
-			
+
 			// Try to delete from pool using CAS-like semantics via sync.Map
 			if q.p.tryDeleteQueue(q.key, q) {
 				q.p.queueChPool.Put(q.ch)
@@ -195,6 +195,15 @@ func NewUdpTaskPool() *UdpTaskPool {
 			return make(chan UdpTask, UdpTaskQueueLength)
 		}},
 	}
+}
+
+func (p *UdpTaskPool) Count() int {
+	count := 0
+	p.queues.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	return count
 }
 
 // EmitTask: Make sure packets with the same key (4 tuples) will be sent in order.

@@ -60,6 +60,9 @@ type ControlPlane struct {
 	// 3. All reads happen-after the ready channel is closed
 	outbounds     []*outbound.DialerGroup
 	inConnections sync.Map
+	// key: ConnMetricKey, value: *atomic.Uint64
+	tcpConnectionTotals sync.Map
+	udpConnectionTotals sync.Map
 
 	dnsController    *DnsController
 	dnsListener      *DNSListener
@@ -620,6 +623,23 @@ func (c *ControlPlane) EjectBpf() *bpfObjects {
 
 func (c *ControlPlane) InjectBpf(bpf *bpfObjects) {
 	c.core.InjectBpf(bpf)
+}
+
+func (c *ControlPlane) Outbounds() []*outbound.DialerGroup {
+	return c.outbounds
+}
+
+func (c *ControlPlane) GetDnsController() *DnsController {
+	return c.dnsController
+}
+
+func (c *ControlPlane) CountTcpConnections() int {
+	count := 0
+	c.inConnections.Range(func(_, _ interface{}) bool {
+		count++
+		return true
+	})
+	return count
 }
 
 func (c *ControlPlane) CloneDnsCache() map[string]*DnsCache {

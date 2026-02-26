@@ -250,3 +250,82 @@ func TestDialerGroup_SetAlive(t *testing.T) {
 		t.Fail()
 	}
 }
+
+func TestDialerGroup_Select_MinMovingAverageRegression(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	d1 := newDirectDialer(option, false)
+	d2 := newDirectDialer(option, false)
+	g := NewDialerGroup(option, "test-group", []*dialer.Dialer{d1, d2}, newEmptyAnnotations(2),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_MinMovingAverageLatencies},
+		func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+
+	d1.ReportUnavailable(TestNetworkType, errors.New("probe failed"))
+	d1.ReportUnavailable(TestNetworkType, errors.New("probe failed"))
+	d2.ReportUnavailable(TestNetworkType, errors.New("probe failed"))
+	set := g.MustGetAliveDialerSet(TestNetworkType)
+	set.NotifyLatencyChange(d1, true)
+	set.NotifyLatencyChange(d2, true)
+
+	d, _, err := g.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != d2 {
+		t.Fatalf("expected dialer with lower moving average to be selected, got=%s", d.Property().Name)
+	}
+}
+
+func TestDialerGroup_Select_Smart(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	d1 := newDirectDialer(option, false)
+	d2 := newDirectDialer(option, false)
+	g := NewDialerGroup(option, "test-group", []*dialer.Dialer{d1, d2}, newEmptyAnnotations(2),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Smart},
+		func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+
+	d1.ReportUnavailable(TestNetworkType, errors.New("dial failed"))
+	d1.ReportUnavailable(TestNetworkType, errors.New("dial failed"))
+	d2.ReportUnavailable(TestNetworkType, errors.New("dial failed"))
+	set := g.MustGetAliveDialerSet(TestNetworkType)
+	set.NotifyLatencyChange(d1, true)
+	set.NotifyLatencyChange(d2, true)
+
+	d, _, err := g.Select(TestNetworkType, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d != d2 {
+		t.Fatalf("expected smart policy to avoid penalized dialer, got=%s", d.Property().Name)
+	}
+}
+
+func TestDialerGroup_NewDialerGroup_SmartRequiresAliveState(t *testing.T) {
+	option := &dialer.GlobalOption{
+		Log:               log,
+		TcpCheckOptionRaw: dialer.TcpCheckOptionRaw{Raw: []string{testTcpCheckUrl}},
+		CheckDnsOptionRaw: dialer.CheckDnsOptionRaw{Raw: []string{testUdpCheckDns}},
+		CheckInterval:     15 * time.Second,
+	}
+	dialers := []*dialer.Dialer{
+		newDirectDialer(option, false),
+	}
+	g := NewDialerGroup(option, "test-group", dialers, newEmptyAnnotations(len(dialers)),
+		DialerSelectionPolicy{Policy: consts.DialerSelectionPolicy_Smart},
+		func(alive bool, networkType *dialer.NetworkType, isInit bool) {})
+	if g.AliveDialerSets()[4] == nil {
+		t.Fatal("expected tcp4 alive dialer set for smart policy")
+	}
+	if g.AliveDialerSets()[5] == nil {
+		t.Fatal("expected tcp6 alive dialer set for smart policy")
+	}
+}

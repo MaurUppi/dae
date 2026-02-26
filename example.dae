@@ -29,6 +29,16 @@ global {
     # Set non-zero value to enable pprof.
     pprof_port: 0
 
+    # Endpoint configuration for metrics and diagnostics.
+    # Set a listen address to enable the endpoint server (disabled by default).
+    #endpoint_listen_address: '0.0.0.0:5556'
+    #endpoint_username: ''
+    #endpoint_password: ''
+    #endpoint_tls_certificate: ''
+    #endpoint_tls_key: ''
+    #endpoint_prometheus_enabled: true
+    #endpoint_prometheus_path: /metrics
+
     # If not zero, traffic sent from dae will be set SO_MARK. It is useful to avoid traffic loop with iptables tproxy
     # rules.
     so_mark_from_dae: 0
@@ -277,6 +287,12 @@ group {
         #policy: min
 
         # Select the node with min moving average of latencies from the group for every connection.
+        #policy: min_moving_avg
+
+        # Smart policy: select by moving average + runtime failure penalty.
+        # Recommended when you want faster failover on transient dial failures.
+        #policy: smart
+
         policy: min_moving_avg
     }
 

@@ -54,7 +54,8 @@ func NewDialerGroup(
 	case consts.DialerSelectionPolicy_Random,
 		consts.DialerSelectionPolicy_MinLastLatency,
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
-		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
+		consts.DialerSelectionPolicy_MinMovingAverageLatencies,
+		consts.DialerSelectionPolicy_Smart:
 		// Need to know the alive state or latency.
 		needAliveState = true
 
@@ -182,6 +183,17 @@ func (g *DialerGroup) GetSelectionPolicy() (policy consts.DialerSelectionPolicy)
 	return g.selectionPolicy.Policy
 }
 
+func (g *DialerGroup) AliveDialerSets() [6]*dialer.AliveDialerSet {
+	return g.aliveDialerSets
+}
+
+func (g *DialerGroup) SelectionPolicyName() string {
+	if g.selectionPolicy == nil {
+		return ""
+	}
+	return string(g.selectionPolicy.Policy)
+}
+
 func (d *DialerGroup) MustGetAliveDialerSet(typ *dialer.NetworkType) *dialer.AliveDialerSet {
 	if typ.IsDns {
 		switch typ.L4Proto {
@@ -270,6 +282,14 @@ func (g *DialerGroup) _select(networkType *dialer.NetworkType, policy *DialerSel
 		consts.DialerSelectionPolicy_MinAverage10Latencies,
 		consts.DialerSelectionPolicy_MinMovingAverageLatencies:
 		d, latency := a.GetMinLatency()
+		if d == nil {
+			// No alive dialer.
+			return nil, time.Hour, ErrNoAliveDialer
+		}
+		return d, latency, nil
+
+	case consts.DialerSelectionPolicy_Smart:
+		d, latency := a.GetSmartBest()
 		if d == nil {
 			// No alive dialer.
 			return nil, time.Hour, ErrNoAliveDialer
