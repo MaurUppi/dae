@@ -265,7 +265,7 @@ loop:
 			log = logrus.New()
 			logger.SetLogger(log, newConf.Global.LogLevel, disableTimestamp, nil)
 			logger.SetLogger(logrus.StandardLogger(), newConf.Global.LogLevel, disableTimestamp, nil)
-			log.SetOutput(oldLogOutput) // FIXME: THIS IS A HACK.
+			log.SetOutput(oldLogOutput) // NOTE: Restore log output after creating new logger during reload.
 			logrus.SetOutput(oldLogOutput)
 
 			newEndpointCfg := endpointConfigFromGlobal(newConf, log)
@@ -413,7 +413,7 @@ func validateEndpointTLSFiles(cfg metrics.EndpointConfig) error {
 	return nil
 }
 
-func newControlPlane(log *logrus.Logger, bpf interface{}, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string) (c *control.ControlPlane, err error) {
+func newControlPlane(log *logrus.Logger, bpf any, dnsCache map[string]*control.DnsCache, conf *config.Config, externGeoDataDirs []string) (c *control.ControlPlane, err error) {
 	// Deep copy to prevent modification.
 	conf = deepcopy.Copy(conf).(*config.Config)
 
