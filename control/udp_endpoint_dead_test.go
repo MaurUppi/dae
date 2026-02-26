@@ -91,6 +91,26 @@ func TestUdpEndpointPool_GetOrCreate_DeadEndpointRemoval(t *testing.T) {
 	require.Nil(t, ue)
 }
 
+// TestUdpEndpointPool_Get_DeadEndpointMiss ensures Get() does not return dead endpoints.
+func TestUdpEndpointPool_Get_DeadEndpointMiss(t *testing.T) {
+	p := NewUdpEndpointPool()
+	lAddr := netip.MustParseAddrPort("10.0.0.1:12348")
+
+	deadEndpoint := &UdpEndpoint{
+		NatTimeout: DefaultNatTimeout,
+	}
+	deadEndpoint.dead.Store(true)
+	deadEndpoint.expiresAtNano.Store(1)
+	p.pool.Store(lAddr, deadEndpoint)
+
+	ue, ok := p.Get(lAddr)
+	require.False(t, ok, "Get should miss for dead endpoint")
+	require.Nil(t, ue, "Get should return nil endpoint for dead endpoint")
+
+	_, stillPresent := p.pool.Load(lAddr)
+	require.False(t, stillPresent, "dead endpoint should be removed from pool on Get")
+}
+
 // TestUdpEndpointPool_DeadEndpointNotRevived tests that RefreshTtl cannot
 // revive a dead endpoint for reuse purposes because GetOrCreate checks IsDead().
 func TestUdpEndpointPool_DeadEndpointNotRevived(t *testing.T) {

@@ -1160,7 +1160,10 @@ func (c *ControlPlane) Serve(readyChan chan<- bool, listener *Listener) (err err
 				}
 
 				if e := c.handlePkt(udpConn, data, convergeSrc, realDst, realDst, routingResult, false); e != nil {
-					c.log.Warnln("handlePkt:", e)
+					c.log.WithFields(logrus.Fields{
+						"src": convergeSrc.String(),
+						"dst": realDst.String(),
+					}).Warnln("handlePkt:", e)
 					return
 				}
 

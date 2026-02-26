@@ -101,11 +101,12 @@ func (ue *UdpEndpoint) start() {
 }
 
 func (ue *UdpEndpoint) WriteTo(b []byte, addr string) (int, error) {
-	// Refresh TTL on write to keep endpoint alive for active connections
-	// This is especially important for QUIC connections where the server
-	// might respond slowly during handshake
+	n, err := ue.conn.WriteTo(b, addr)
+	if err != nil {
+		return n, err
+	}
 	ue.RefreshTtl()
-	return ue.conn.WriteTo(b, addr)
+	return n, nil
 }
 
 func (ue *UdpEndpoint) Close() error {
@@ -213,7 +214,16 @@ func (p *UdpEndpointPool) Get(lAddr netip.AddrPort) (udpEndpoint *UdpEndpoint, o
 	if !ok {
 		return nil, ok
 	}
-	return _ue.(*UdpEndpoint), ok
+	ue := _ue.(*UdpEndpoint)
+	if ue.IsDead() {
+		// Best-effort cleanup for dead endpoints on fast-path lookup.
+		// Only delete when the loaded pointer still matches.
+		if _ue2, ok2 := p.pool.Load(lAddr); ok2 && _ue2 == _ue {
+			p.pool.Delete(lAddr)
+		}
+		return nil, false
+	}
+	return ue, true
 }
 
 func (p *UdpEndpointPool) Count() int {
