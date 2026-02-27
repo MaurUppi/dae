@@ -1,0 +1,42 @@
+name: UDP TaskPool TDD (Linux eBPF)
+
+on:
+  push:
+    branches:
+      - broken-pipe-patch
+    paths:
+      - "control/udp_task_pool*.go"
+      - "component/sniffing/quic*.go"
+      - ".github/workflows/udp-taskpool-tdd.yml"
+
+jobs:
+  tdd-race-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go 1.26
+        run: |
+          wget -q https://go.dev/dl/go1.26.0.linux-amd64.tar.gz
+          sudo rm -rf /usr/local/go
+          sudo tar -C /usr/local -xzf go1.26.0.linux-amd64.tar.gz
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+
+      - name: Install LLVM and Clang
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang llvm
+
+      - name: Generate eBPF bindings
+        run: |
+          make ebpf
+
+      - name: Run UDP TaskPool tests with race detector
+        run: |
+          go test -v -race -timeout 30s ./control/... -run "TestUdpTaskPool"
+
+      - name: Run QUIC header filter tests
+        run: |
+          go test -v ./component/sniffing -run "TestIsLikelyQuicInitialPacket"
