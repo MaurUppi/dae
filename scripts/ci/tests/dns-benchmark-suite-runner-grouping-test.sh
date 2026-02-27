@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(git rev-parse --show-toplevel)"
 cd "$REPO_ROOT"
+source scripts/ci/dns-benchmark-suites.sh
 
 TMP_DIR="$(mktemp -d)"
 LOG_FILE="$TMP_DIR/compare-calls.log"
@@ -45,12 +46,21 @@ ARTIFACT_DIR="$ARTIFACT_DIR" \
 ./scripts/ci/dns-benchmark-suite-runner.sh HEAD HEAD >/dev/null
 
 line_count="$(wc -l <"$LOG_FILE" | tr -d '[:space:]')"
-if [[ "$line_count" -ne 6 ]]; then
-  echo "expected 6 suite invocations, got $line_count" >&2
+read -r -a expected_suites <<<"$(dns_bench_profile_suites dns-module)"
+expected_count="${#expected_suites[@]}"
+if [[ "$line_count" -ne "$expected_count" ]]; then
+  echo "expected $expected_count suite invocations, got $line_count" >&2
   exit 1
 fi
 
-control_lines="$(grep -E 'suite=control_(core_flow|singleflight_scale|cache_hotpath|cache_structures|cache_regression_guard) ' "$LOG_FILE" || true)"
+for suite in "${expected_suites[@]}"; do
+  if ! grep -q -E "suite=${suite} " "$LOG_FILE"; then
+    echo "missing suite call: $suite" >&2
+    exit 1
+  fi
+done
+
+control_lines="$(grep -E 'suite=control_' "$LOG_FILE" || true)"
 component_line="$(grep -E 'suite=component_upstream_hotpath ' "$LOG_FILE" || true)"
 
 [[ -n "$control_lines" ]] || { echo "missing control suite calls"; exit 1; }
