@@ -1,0 +1,360 @@
+name: UDP TaskPool TDD (Linux eBPF)
+
+on:
+  push:
+    branches:
+      - broken-pipe-patch
+    paths:
+      - "control/udp_task_pool*.go"
+      - "component/sniffing/quic*.go"
+      - ".github/workflows/udp-taskpool-tdd.yml"
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "control/udp_task_pool*.go"
+      - "component/sniffing/quic*.go"
+      - ".github/workflows/udp-taskpool-tdd.yml"
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  tdd-race-test:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Go 1.26
+        run: |
+          wget -q https://go.dev/dl/go1.26.0.linux-amd64.tar.gz
+          sudo rm -rf /usr/local/go
+          sudo tar -C /usr/local -xzf go1.26.0.linux-amd64.tar.gz
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+
+      - name: Install LLVM and Clang
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y clang llvm
+
+      - name: Install benchstat
+        run: |
+          GOTOOLCHAIN=auto go install golang.org/x/perf/cmd/benchstat@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Generate eBPF bindings
+        run: |
+          make ebpf
+
+      - name: Init Test Artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p tdd-artifacts
+          {
+            echo "EVENT_NAME=${{ github.event_name }}"
+            echo "REF_NAME=${{ github.ref_name }}"
+            echo "SHA=${{ github.sha }}"
+          } > tdd-artifacts/meta.env
+
+      - name: Run UDP TaskPool tests with race detector
+        shell: bash
+        run: |
+          set +e
+          go test -v -race -timeout 30s ./control/... -run "Test(UdpTaskPool|CompareAndDelete|NoGoroutineLeak|ConvoyExitAfterFailedDelete|HighConcurrencyStress)" \
+            2>&1 | tee tdd-artifacts/taskpool-race.log
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "TASKPOOL_TEST_STATUS=$status" >> tdd-artifacts/meta.env
+
+      - name: Run QUIC header filter tests
+        shell: bash
+        run: |
+          set +e
+          go test -v ./component/sniffing -run "TestIsLikelyQuicInitialPacket" \
+            2>&1 | tee tdd-artifacts/quic-filter.log
+          status=${PIPESTATUS[0]}
+          set -e
+          echo "QUIC_TEST_STATUS=$status" >> tdd-artifacts/meta.env
+
+      - name: Run UDP TaskPool benchmark compare
+        if: always() && github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set +e
+          mkdir -p tdd-artifacts/bench
+
+          BASE_REF="origin/${{ github.base_ref }}"
+          HEAD_REF="${{ github.sha }}"
+          BENCH_COUNT=3
+          BENCH_TIME=200ms
+
+          {
+            echo "BENCH_BASE_REF=$BASE_REF"
+            echo "BENCH_HEAD_REF=$HEAD_REF"
+            echo "BENCH_COUNT=$BENCH_COUNT"
+            echo "BENCH_TIME=$BENCH_TIME"
+          } >> tdd-artifacts/meta.env
+
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          BASE_SHA="$(git rev-parse "$BASE_REF")"
+          HEAD_SHA="$(git rev-parse "$HEAD_REF")"
+
+          base_wt="$(mktemp -d)"
+          head_wt="$(mktemp -d)"
+          git worktree add --detach "$base_wt" "$BASE_SHA"
+          git worktree add --detach "$head_wt" "$HEAD_SHA"
+
+          (cd "$base_wt" && git submodule update --init --recursive && make ebpf) > tdd-artifacts/bench/base-prepare.log 2>&1
+          base_prep_status=$?
+          (cd "$head_wt" && git submodule update --init --recursive && make ebpf) > tdd-artifacts/bench/head-prepare.log 2>&1
+          head_prep_status=$?
+
+          bench_failed=0
+
+          if [[ $base_prep_status -ne 0 || $head_prep_status -ne 0 ]]; then
+            bench_failed=1
+            {
+              echo "Benchmark prepare failed: base=$base_prep_status head=$head_prep_status"
+              echo "--- base prepare log (tail) ---"
+              tail -n 120 tdd-artifacts/bench/base-prepare.log || true
+              echo "--- head prepare log (tail) ---"
+              tail -n 120 tdd-artifacts/bench/head-prepare.log || true
+            } > tdd-artifacts/bench/error.log
+          else
+            suites=(
+              "udp_taskpool_core|BenchmarkUdpTaskPool$"
+              "udp_taskpool_compare_and_delete|BenchmarkCompareAndDelete$"
+              "udp_taskpool_load_and_delete_pattern|BenchmarkLoadAndDeletePattern$"
+            )
+
+            for tuple in "${suites[@]}"; do
+              suite="${tuple%%|*}"
+              regex="${tuple#*|}"
+              suite_dir="tdd-artifacts/bench/$suite"
+              mkdir -p "$suite_dir"
+
+              (cd "$base_wt" && GOWORK=off go test -run '^$' -bench "$regex" -benchmem -count "$BENCH_COUNT" -benchtime "$BENCH_TIME" ./control/...) \
+                > "$suite_dir/base.txt" 2>&1
+              base_status=$?
+
+              (cd "$head_wt" && GOWORK=off go test -run '^$' -bench "$regex" -benchmem -count "$BENCH_COUNT" -benchtime "$BENCH_TIME" ./control/...) \
+                > "$suite_dir/head.txt" 2>&1
+              head_status=$?
+
+              if [[ $base_status -eq 0 && $head_status -eq 0 ]]; then
+                benchstat "$suite_dir/base.txt" "$suite_dir/head.txt" > "$suite_dir/benchstat_common.txt" 2> "$suite_dir/benchstat.err"
+                benchstat_status=$?
+              else
+                benchstat_status=1
+              fi
+
+              {
+                echo "base_status=$base_status"
+                echo "head_status=$head_status"
+                echo "benchstat_status=$benchstat_status"
+              } > "$suite_dir/result.env"
+
+              # Suite pass/fail is based on whether both benchmark runs completed.
+              # benchstat may legitimately have no common samples (delta shown as n/a).
+              if [[ $base_status -eq 0 && $head_status -eq 0 ]]; then
+                echo "0" > "$suite_dir/status.txt"
+              else
+                bench_failed=1
+                echo "1" > "$suite_dir/status.txt"
+              fi
+            done
+          fi
+
+          echo "BENCH_STATUS=$bench_failed" >> tdd-artifacts/meta.env
+
+          git worktree remove --force "$base_wt"
+          git worktree remove --force "$head_wt"
+          rmdir "$base_wt" "$head_wt" 2>/dev/null || true
+          set -e
+
+      - name: Build PR Summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # shellcheck disable=SC1091
+          source tdd-artifacts/meta.env
+
+          taskpool_status="${TASKPOOL_TEST_STATUS:-1}"
+          quic_status="${QUIC_TEST_STATUS:-1}"
+          bench_status="${BENCH_STATUS:-0}"
+
+          pass_count=0
+          if [[ "$taskpool_status" == "0" ]]; then
+            pass_count=$((pass_count + 1))
+          fi
+          if [[ "$quic_status" == "0" ]]; then
+            pass_count=$((pass_count + 1))
+          fi
+
+          bench_total=0
+          bench_passed=0
+          bench_failed=0
+          bench_suite_lines=""
+          bench_delta_lines=""
+
+          extract_time_geomean_line() {
+            local file="$1"
+            [[ -f "$file" ]] || return 1
+            awk '$1=="geomean" {print; exit}' "$file"
+          }
+
+          suite_delta_summary() {
+            local suite="$1"
+            local benchstat_file="tdd-artifacts/bench/$suite/benchstat_common.txt"
+            local geomean_line old_v new_v delta_v
+            geomean_line="$(extract_time_geomean_line "$benchstat_file" || true)"
+            if [[ -z "$geomean_line" ]]; then
+              echo "- \`$suite\`: n/a (no common benchmark delta)"
+              return 0
+            fi
+
+            old_v="$(awk '{print $2}' <<<"$geomean_line")"
+            new_v="$(awk '{print $3}' <<<"$geomean_line")"
+            delta_v="$(grep -Eo '([+-][0-9]+(\.[0-9]+)?%|[+-]?Inf%)' <<<"$geomean_line" | head -n1 || true)"
+            [[ -z "$old_v" ]] && old_v="n/a"
+            [[ -z "$new_v" ]] && new_v="n/a"
+            [[ -z "$delta_v" ]] && delta_v="n/a"
+            echo "- \`$suite\`: \`$old_v -> $new_v\` (Δ \`$delta_v\`)"
+          }
+
+          if [[ "$EVENT_NAME" == "pull_request" ]]; then
+            while IFS= read -r status_file; do
+              suite="$(basename "$(dirname "$status_file")")"
+              status="$(cat "$status_file" 2>/dev/null || echo 1)"
+              bench_total=$((bench_total + 1))
+              if [[ "$status" == "0" ]]; then
+                bench_passed=$((bench_passed + 1))
+                bench_suite_lines+="- ✅ \`$suite\`: pass"$'\n'
+              else
+                bench_failed=$((bench_failed + 1))
+                bench_suite_lines+="- ❌ \`$suite\`: failed"$'\n'
+              fi
+              bench_delta_lines+="$(suite_delta_summary "$suite")"$'\n'
+            done < <(find tdd-artifacts/bench -mindepth 2 -maxdepth 2 -name status.txt | sort)
+          fi
+
+          overall="not pass"
+          if [[ "$taskpool_status" == "0" && "$quic_status" == "0" ]]; then
+            overall="pass"
+          fi
+
+          {
+            echo "## UDP TaskPool TDD Summary"
+            echo
+            echo "- Ref: \`${REF_NAME}\`"
+            echo "- Commit: \`${SHA}\`"
+            echo "- Overall: **${overall}** (${pass_count}/2 passed)"
+            echo "- Workflow run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "- Full report artifact: \`udp-taskpool-tdd-${{ github.run_id }}\`"
+            echo
+            echo "### Test Status"
+            echo
+            if [[ "$taskpool_status" == "0" ]]; then
+              echo "- ✅ \`go test -race ./control/... -run Test(UdpTaskPool|CompareAndDelete|NoGoroutineLeak|ConvoyExitAfterFailedDelete|HighConcurrencyStress)\`: pass"
+            else
+              echo "- ❌ \`go test -race ./control/... -run Test(UdpTaskPool|CompareAndDelete|NoGoroutineLeak|ConvoyExitAfterFailedDelete|HighConcurrencyStress)\`: failed (exit ${taskpool_status})"
+            fi
+
+            if [[ "$quic_status" == "0" ]]; then
+              echo "- ✅ \`go test ./component/sniffing -run TestIsLikelyQuicInitialPacket\`: pass"
+            else
+              echo "- ❌ \`go test ./component/sniffing -run TestIsLikelyQuicInitialPacket\`: failed (exit ${quic_status})"
+            fi
+            echo
+            echo "### Suite Delta (time/op geomean)"
+            echo
+            if [[ "$EVENT_NAME" != "pull_request" ]]; then
+              echo "- skipped (not pull_request event)"
+            elif [[ "$bench_total" -eq 0 ]]; then
+              if [[ "$bench_status" == "0" ]]; then
+                echo "- n/a (no benchmark suite result generated)"
+              else
+                echo "- failed to generate benchmark delta (BENCH_STATUS=${bench_status})"
+              fi
+            else
+              if [[ -n "${BENCH_BASE_REF:-}" && -n "${BENCH_HEAD_REF:-}" ]]; then
+                echo "- Before (base): \`${BENCH_BASE_REF}\`"
+                echo "- After (head): \`${BENCH_HEAD_REF}\`"
+                echo "- Bench params: \`-count=${BENCH_COUNT:-n/a} -benchtime=${BENCH_TIME:-n/a}\`"
+                echo
+              fi
+              echo "#### Suite Status"
+              echo
+              printf "%s" "$bench_suite_lines"
+              echo
+              echo "#### Delta"
+              echo
+              printf "%s" "$bench_delta_lines"
+            fi
+          } > tdd-artifacts/pr-summary.md
+
+          cat tdd-artifacts/pr-summary.md >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload TDD Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: udp-taskpool-tdd-${{ github.run_id }}
+          path: tdd-artifacts
+          if-no-files-found: warn
+
+      - name: Update PR Comment
+        if: always() && github.event_name == 'pull_request' && hashFiles('tdd-artifacts/pr-summary.md') != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const marker = "<!-- dae-udp-taskpool-tdd -->";
+            const report = fs.readFileSync("tdd-artifacts/pr-summary.md", "utf8");
+            const body = `${marker}\n${report}`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number,
+              per_page: 100
+            });
+
+            const existing = comments.find((c) => c.body && c.body.includes(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner,
+                repo,
+                comment_id: existing.id,
+                body
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number,
+                body
+              });
+            }
+
+      - name: Enforce Job Result
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source tdd-artifacts/meta.env
+          taskpool_status="${TASKPOOL_TEST_STATUS:-1}"
+          quic_status="${QUIC_TEST_STATUS:-1}"
+          if [[ "$taskpool_status" != "0" || "$quic_status" != "0" ]]; then
+            echo "One or more test suites failed."
+            exit 1
+          fi

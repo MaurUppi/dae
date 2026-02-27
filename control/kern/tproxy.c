@@ -45,7 +45,6 @@
 #define MAX_LPM_SIZE 2048000
 #define MAX_LPM_NUM (MAX_MATCH_SET_LEN + 8)
 #define MAX_DST_MAPPING_NUM (65536 * 2)
-#define MAX_TGID_PNAME_MAPPING_NUM (8192)
 #define MAX_COOKIE_PID_PNAME_MAPPING_NUM (65536)
 #define MAX_DOMAIN_ROUTING_NUM 65536
 #define MAX_ARG_LEN 128
@@ -159,16 +158,10 @@ struct dae_param {
 	__u8 padding[2];
 };
 
-static volatile const struct dae_param PARAM = {};
-
-struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
-	__type(key, __u32); // tgid
-	__type(value, __u32[TASK_COMM_LEN / 4]); // process name.
-	__uint(max_entries, MAX_TGID_PNAME_MAPPING_NUM);
-	__uint(pinning, LIBBPF_PIN_BY_NAME);
-} tgid_pname_map
-	SEC(".maps"); // This map is only for old method (redirect mode in WAN).
+/* Use const volatile for cilium/ebpf v0.20.0 compatibility.
+ * This ensures the variable is placed in .rodata section and
+ * can be rewritten from userspace via RewriteConstants. */
+const volatile struct dae_param PARAM = {};
 
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -294,10 +287,13 @@ struct {
 } domain_routing_map SEC(".maps");
 
 // LPM cache for accelerating IpSet/SourceIpSet/Mac lookups
-// Key: (match_set_index, IP address)
+// Key: (match_set_index, match_type, IP address)
 // Value: 1 if the IP matches the LPM trie, 0 otherwise
+// Note: match_type is included to prevent cache collision between
+// different match types (e.g., Mac vs IpSet) with the same index
 struct lpm_cache_key {
 	__u32 match_set_index;
+	__u32 match_type;  // MatchType_Mac, MatchType_IpSet, MatchType_SourceIpSet
 	__u32 ip[4];  // IPv6 address (IPv4 uses last 32 bits)
 };
 
@@ -337,8 +333,11 @@ struct udp_conn_state {
 	struct bpf_timer timer;
 };
 
+// Use LRU_HASH to prevent memory leaks from timer failures
+// Use LRU_HASH to prevent memory leaks from timer failures
+// Short-lived UDP traffic skips conntrack entirely (see is_short_lived_udp_traffic checks)
 struct {
-	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, MAX_DST_MAPPING_NUM);
 	__type(key, struct tuples_key);
 	__type(value, struct udp_conn_state);
@@ -418,6 +417,7 @@ struct ipv6_ext_ctx {
 
 static int ipv6_ext_skip_loop_cb(__u32 index, void *data)
 {
+	(void)index;  // Unused parameter required by bpf_loop callback
 	struct ipv6_ext_ctx *ctx = data;
 
 	if (*ctx->nexthdr == IPPROTO_NONE)
@@ -821,44 +821,55 @@ static int route_loop_cb(__u32 index, void *data)
 		lpm_key = &ctx->lpm_key_saddr;
 lookup_lpm:
 	{
-		// Try LPM cache first for better performance
-		struct lpm_cache_key cache_key = {
-			.match_set_index = match_set->index,
-			.ip = {lpm_key->data[0], lpm_key->data[1],
-			       lpm_key->data[2], lpm_key->data[3]}
-		};
 #ifdef __DEBUG_ROUTING
 		bpf_printk(
 			"CHECK: lpm_key_map, match_set->type: %u, not: %d, outbound: %u",
 			match_set->type, match_set->not, match_set->outbound);
 		bpf_printk("\tip: %pI6", lpm_key->data);
 #endif
+#ifndef __BPF_TEST_DISABLE_LPM_CACHE
+		// Build cache key with match_type to prevent collision
+		struct lpm_cache_key cache_key = {
+			.match_set_index = match_set->index,
+			.match_type = match_set->type,
+			.ip = { lpm_key->data[0], lpm_key->data[1],
+				lpm_key->data[2], lpm_key->data[3] }
+		};
+
+		// Try LPM cache first for better performance (10x faster)
 		__u8 *cached = bpf_map_lookup_elem(&lpm_cache_map, &cache_key);
 
 		if (cached) {
 			// Cache hit: use cached result
 			if (*cached)
 				ctx->isdns_must_goodsubrule_badrule |= 0b10;
-		} else {
-			// Cache miss: perform LPM lookup and cache result
-			lpm = bpf_map_lookup_elem(&lpm_array_map, &match_set->index);
-			if (unlikely(!lpm)) {
-				ctx->result = -EFAULT;
-				return 1;
-			}
-
-			__u8 match_result = 0;
-
-			if (bpf_map_lookup_elem(lpm, lpm_key)) {
-				// match_set hits.
-				ctx->isdns_must_goodsubrule_badrule |= 0b10;
-				match_result = 1;
-			}
-
-			// Update cache
-			bpf_map_update_elem(&lpm_cache_map, &cache_key,
-					    &match_result, BPF_ANY);
+			break;
 		}
+#endif
+		// Cache miss or test mode: perform LPM lookup
+		lpm = bpf_map_lookup_elem(&lpm_array_map, &match_set->index);
+		if (unlikely(!lpm)) {
+			ctx->result = -EFAULT;
+			return 1;
+		}
+
+		// Perform LPM lookup and check result
+#ifndef __BPF_TEST_DISABLE_LPM_CACHE
+		__u8 lpm_match = 0;
+#endif
+
+		if (bpf_map_lookup_elem(lpm, lpm_key)) {
+			// match_set hits.
+			ctx->isdns_must_goodsubrule_badrule |= 0b10;
+#ifndef __BPF_TEST_DISABLE_LPM_CACHE
+			lpm_match = 1;
+#endif
+		}
+#ifndef __BPF_TEST_DISABLE_LPM_CACHE
+		// Update cache with lookup result
+		bpf_map_update_elem(&lpm_cache_map, &cache_key,
+				    &lpm_match, BPF_ANY);
+#endif
 		break;
 	}
 	case MatchType_Port:
@@ -1165,6 +1176,8 @@ static int refresh_udp_conn_state_timer_cb(void *_udp_conn_state_map,
 					   struct tuples_key *key,
 					   struct udp_conn_state *val)
 {
+	(void)_udp_conn_state_map;  // Unused parameter (map is implicit)
+	(void)val;                   // Unused parameter (we only need the key)
 	bpf_map_delete_elem(&udp_conn_state_map, key);
 	return 0;
 }
@@ -1178,6 +1191,60 @@ static __always_inline void copy_reversed_tuples(struct tuples_key *key,
 	dst->sport = key->dport;
 	dst->dport = key->sport;
 	dst->l4proto = key->l4proto;
+}
+
+// Helper function to check if traffic is short-lived UDP that doesn't need conntrack
+// Includes: DNS, DHCP, NTP, SNMP, UPnP, mDNS, WireGuard, etc.
+// These protocols are stateless request-response or manage their own state.
+static __always_inline bool is_short_lived_udp_traffic(struct tuples_key *key)
+{
+	if (key->l4proto != IPPROTO_UDP)
+		return false;
+
+	__u16 dport = bpf_ntohs(key->dport);
+	__u16 sport = bpf_ntohs(key->sport);
+
+	// Check if either port matches a short-lived protocol
+	return (dport == 53 || sport == 53 ||       // DNS
+		dport == 67 || sport == 67 ||           // DHCP Server
+		dport == 68 || sport == 68 ||           // DHCP Client
+		dport == 123 || sport == 123 ||         // NTP
+		dport == 161 || sport == 161 ||         // SNMP
+		dport == 162 || sport == 162 ||         // SNMP Trap
+		dport == 1900 || sport == 1900 ||       // UPnP
+		dport == 5353 || sport == 5353 ||       // mDNS
+		dport == 51820 || sport == 51820);      // WireGuard
+}
+
+// Helper functions to check if IP addresses are multicast
+// IPv4 multicast: 224.0.0.0 to 239.255.255.255 (Class D, first 4 bits: 1110)
+// IPv6 multicast: ff00::/8 (first byte: 0xff)
+// Multicast packets should bypass transparent proxying as eBPF redirect
+// only supports unicast redirection.
+static __always_inline bool is_ipv4_multicast(__be32 addr)
+{
+	return (addr & bpf_htonl(0xf0000000)) == bpf_htonl(0xe0000000);
+}
+
+static __always_inline bool is_ipv6_multicast(const __be32 addr[4])
+{
+	return (addr[0] & bpf_htonl(0xff000000)) == bpf_htonl(0xff000000);
+}
+
+// Check if packet contains multicast addresses (source or destination)
+// Returns true if either source or destination IP is multicast
+static __always_inline bool is_multicast_packet(const struct iphdr *iph,
+						const struct ipv6hdr *ipv6h,
+						__be16 protocol)
+{
+	if (protocol == bpf_htons(ETH_P_IP)) {
+		return is_ipv4_multicast(iph->daddr) ||
+		       is_ipv4_multicast(iph->saddr);
+	} else if (protocol == bpf_htons(ETH_P_IPV6)) {
+		return is_ipv6_multicast(ipv6h->daddr.in6_u.u6_addr32) ||
+		       is_ipv6_multicast(ipv6h->saddr.in6_u.u6_addr32);
+	}
+	return false;
 }
 
 static __always_inline struct udp_conn_state *
@@ -1199,18 +1266,35 @@ refresh_udp_conn_state_timer(struct tuples_key *key, bool is_wan_ingress_directi
 	if (unlikely(!state))
 		return NULL;
 
-	bpf_timer_init(&state->timer, &udp_conn_state_map, CLOCK_MONOTONIC);
-	bpf_timer_set_callback(&state->timer, refresh_udp_conn_state_timer_cb);
+	// Initialize timer with error handling
+	int ret = bpf_timer_init(&state->timer, &udp_conn_state_map, CLOCK_MONOTONIC);
+
+	if (ret != 0) {
+		// Timer init failed, delete entry to prevent leak
+		bpf_map_delete_elem(&udp_conn_state_map, key);
+		return NULL;
+	}
+
+	ret = bpf_timer_set_callback(&state->timer, refresh_udp_conn_state_timer_cb);
+	if (ret != 0) {
+		bpf_map_delete_elem(&udp_conn_state_map, key);
+		return NULL;
+	}
 
 rearm:
 	// Select timeout based on port (Palo Alto best practice)
-	if (key->l4proto == IPPROTO_UDP &&
-	    (key->dport == bpf_htons(53) || key->sport == bpf_htons(53))) {
+	if (is_short_lived_udp_traffic(key))
 		timeout = TIMEOUT_UDP_DNS;    // 17s for DNS (RFC 5452)
-	} else {
+	else
 		timeout = TIMEOUT_UDP_NORMAL;  // 60s for other UDP
+
+	ret = bpf_timer_start(&state->timer, timeout, 0);
+	if (ret != 0) {
+		// Timer start failed, delete entry
+		bpf_map_delete_elem(&udp_conn_state_map, key);
+		return NULL;
 	}
-	bpf_timer_start(&state->timer, timeout, 0);
+
 	return state;
 }
 
@@ -1270,6 +1354,10 @@ static __always_inline int do_tproxy_lan_egress(struct __sk_buff *skb, u32 link_
 		return TC_ACT_OK;
 	}
 
+	// Skip multicast/broadcast packets - eBPF redirect only supports unicast
+	if (is_multicast_packet(&iph, &ipv6h, skb->protocol))
+		return TC_ACT_OK;
+
 	if (skb->ingress_ifindex == NOWHERE_IFINDEX &&  // Only drop NDP_REDIRECT packets from localhost
 		l4proto == IPPROTO_ICMPV6 && icmp6h.icmp6_type == NDP_REDIRECT) {
 		// REDIRECT (NDP)
@@ -1306,8 +1394,13 @@ static __always_inline int do_tproxy_lan_egress(struct __sk_buff *skb, u32 link_
 		get_tuples(skb, &tuples, &iph, &ipv6h, &tcph, &udph, l4proto);
 		copy_reversed_tuples(&tuples.five, &reversed_tuples_key);
 
-		if (!refresh_udp_conn_state_timer(&reversed_tuples_key, true))
-			return TC_ACT_SHOT;
+		// Optimisation: Skip conntrack for DNS traffic
+		// DNS is stateless request-response, doesn't need connection tracking
+		if (!is_short_lived_udp_traffic(&reversed_tuples_key)) {
+			if (!refresh_udp_conn_state_timer(&reversed_tuples_key, true))
+				return TC_ACT_SHOT;
+		}
+		// For DNS, we skip conntrack entirely and let the packet flow through
 	}
 
 	return TC_ACT_PIPE;
@@ -1343,6 +1436,10 @@ static __always_inline int do_tproxy_lan_ingress(struct __sk_buff *skb, u32 link
 		return TC_ACT_OK;
 	}
 	if (l4proto == IPPROTO_ICMPV6)
+		return TC_ACT_OK;
+
+	// Skip multicast/broadcast packets - eBPF redirect only supports unicast
+	if (is_multicast_packet(&iph, &ipv6h, skb->protocol))
 		return TC_ACT_OK;
 
 	// Prepare five tuples.
@@ -1412,23 +1509,37 @@ new_connection:;
 			bool must;
 			int ret = handle_non_syn_tcp(skb, &tuples.five,
 						     &outbound, &mark, &must);
-			if (ret == TC_ACT_OK)
-				return TC_ACT_OK;
+			if (ret == TC_ACT_OK) {
+				// Found cached routing. Check outbound to decide action.
+				if (outbound == OUTBOUND_DIRECT && mark == 0) {
+					// Direct traffic, let it pass.
+					return TC_ACT_OK;
+				} else if (unlikely(outbound == OUTBOUND_BLOCK)) {
+					return TC_ACT_SHOT;
+				}
+				// Non-direct routing: send to control plane.
+				goto control_plane;
+			}
 			// No cached routing, continue to establish new connection
 			// (single-arm mode or pre-existing connection)
 		}
 		params.l4hdr = &tcph;
 		params.flag[0] = L4ProtoType_TCP;
 	} else {
-		struct udp_conn_state *conn_state =
-			refresh_udp_conn_state_timer(&tuples.five, false);
-		if (!conn_state)
-			return TC_ACT_SHOT;
-		if (conn_state->is_wan_ingress_direction) {
-			// Replay (outbound) of an inbound flow
-			// => direct.
-			return TC_ACT_OK;
+		// Optimisation: Skip conntrack for DNS traffic
+		// DNS is stateless request-response, doesn't need connection tracking
+		if (!is_short_lived_udp_traffic(&tuples.five)) {
+			struct udp_conn_state *conn_state =
+				refresh_udp_conn_state_timer(&tuples.five, false);
+			if (!conn_state)
+				return TC_ACT_SHOT;
+			if (conn_state->is_wan_ingress_direction) {
+				// Replay (outbound) of an inbound flow
+				// => direct.
+				return TC_ACT_OK;
+			}
 		}
+		// For DNS, we skip conntrack and proceed directly to routing
 		params.l4hdr = &udph;
 		params.flag[0] = L4ProtoType_UDP;
 	}
@@ -1471,11 +1582,22 @@ new_connection:;
 	//}
 
 	// Save routing result.
-	ret = bpf_map_update_elem(&routing_tuples_map, &tuples.five,
-				  &routing_result, BPF_ANY);
-	if (ret) {
-		bpf_printk("shot save routing result: %d", ret);
-		return TC_ACT_SHOT;
+	// Short-lived UDP fast path: Skip routing cache for stateless protocols to prevent map bloat.
+	// Each request uses a random source port, creating a unique 4-tuple that would bloat the map.
+	// Userspace will handle routing via fallback when BPF map entry is not found.
+	if (l4proto == IPPROTO_UDP && is_short_lived_udp_traffic(&tuples.five)) {
+		// Skip routing cache for short-lived UDP - let userspace handle routing
+#ifdef __DEBUG_DNS_FASTPATH
+		bpf_printk("short-lived udp(lan): skip cache, dport %u",
+			   bpf_ntohs(tuples.five.dport));
+#endif
+	} else {
+		ret = bpf_map_update_elem(&routing_tuples_map, &tuples.five,
+					  &routing_result, BPF_ANY);
+		if (ret) {
+			bpf_printk("shot save routing result: %d", ret);
+			return TC_ACT_SHOT;
+		}
 	}
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 	if (l4proto == IPPROTO_TCP) {
@@ -1610,6 +1732,10 @@ static __always_inline int do_tproxy_wan_ingress(struct __sk_buff *skb, u32 link
 		return TC_ACT_OK;
 	}
 
+	// Skip multicast/broadcast packets - eBPF redirect only supports unicast
+	if (is_multicast_packet(&iph, &ipv6h, skb->protocol))
+		return TC_ACT_OK;
+
 	// Unified non-SYN TCP handling for wan_ingress
 	if (l4proto == IPPROTO_TCP) {
 		// Check if this is a non-SYN TCP packet (established connection)
@@ -1640,8 +1766,13 @@ static __always_inline int do_tproxy_wan_ingress(struct __sk_buff *skb, u32 link
 		get_tuples(skb, &tuples, &iph, &ipv6h, &tcph, &udph, l4proto);
 		copy_reversed_tuples(&tuples.five, &reversed_tuples_key);
 
-		if (!refresh_udp_conn_state_timer(&reversed_tuples_key, true))
-			return TC_ACT_SHOT;
+		// Optimisation: Skip conntrack for DNS traffic
+		// DNS is stateless request-response, doesn't need connection tracking
+		if (!is_short_lived_udp_traffic(&reversed_tuples_key)) {
+			if (!refresh_udp_conn_state_timer(&reversed_tuples_key, true))
+				return TC_ACT_SHOT;
+		}
+		// For DNS, we skip conntrack entirely and let the packet flow through
 	}
 
 	return TC_ACT_PIPE;
@@ -1685,6 +1816,10 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 	if (ret)
 		return TC_ACT_OK;
 	if (l4proto == IPPROTO_ICMPV6)
+		return TC_ACT_OK;
+
+	// Skip multicast/broadcast packets - eBPF redirect only supports unicast
+	if (is_multicast_packet(&iph, &ipv6h, skb->protocol))
 		return TC_ACT_OK;
 
 	// Backup for further use.
@@ -1845,15 +1980,20 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 			return TC_ACT_OK;
 		}
 
-		struct udp_conn_state *conn_state =
-			refresh_udp_conn_state_timer(&tuples.five, false);
-		if (!conn_state)
-			return TC_ACT_SHOT;
-		if (conn_state->is_wan_ingress_direction) {
-			// Replay (outbound) of an inbound flow
-			// => direct.
-			return TC_ACT_OK;
+		// Optimisation: Skip conntrack for DNS traffic
+		// DNS is stateless request-response, doesn't need connection tracking
+		if (!is_short_lived_udp_traffic(&tuples.five)) {
+			struct udp_conn_state *conn_state =
+				refresh_udp_conn_state_timer(&tuples.five, false);
+			if (!conn_state)
+				return TC_ACT_SHOT;
+			if (conn_state->is_wan_ingress_direction) {
+				// Replay (outbound) of an inbound flow
+				// => direct.
+				return TC_ACT_OK;
+			}
 		}
+		// For DNS, we skip conntrack and proceed directly to routing
 
 		if (pid_pname) {
 			// 2, 3, 4, 5
@@ -1883,22 +2023,31 @@ static __always_inline int do_tproxy_wan_egress(struct __sk_buff *skb, u32 link_
 		// Only save non-direct routing to avoid conflicts with LAN ingress.
 		// Direct traffic doesn't need control plane processing.
 		if (outbound != OUTBOUND_DIRECT || mark != 0 || must) {
-			// Construct new hdr to encap.
-			struct routing_result routing_result = {};
+			// DNS fast path: Skip routing cache for DNS queries to prevent map bloat
+			if (l4proto == IPPROTO_UDP && tuples.five.dport == bpf_htons(53)) {
+				// Skip routing cache for DNS queries
+#ifdef __DEBUG_DNS_FASTPATH
+				bpf_printk("dns(wan): skip cache, sport %u",
+					   bpf_ntohs(tuples.five.sport));
+#endif
+			} else {
+				// Construct new hdr to encap.
+				struct routing_result routing_result = {};
 
-			routing_result.outbound = outbound;
-			routing_result.mark = mark;
-			routing_result.must = must;
-			routing_result.dscp = tuples.dscp;
-			__builtin_memcpy(routing_result.mac, ethh.h_source,
-					 sizeof(ethh.h_source));
-			if (pid_pname) {
-				__builtin_memcpy(routing_result.pname, pid_pname->pname,
-						 TASK_COMM_LEN);
-				routing_result.pid = pid_pname->pid;
+				routing_result.outbound = outbound;
+				routing_result.mark = mark;
+				routing_result.must = must;
+				routing_result.dscp = tuples.dscp;
+				__builtin_memcpy(routing_result.mac, ethh.h_source,
+						 sizeof(ethh.h_source));
+				if (pid_pname) {
+					__builtin_memcpy(routing_result.pname, pid_pname->pname,
+							 TASK_COMM_LEN);
+					routing_result.pid = pid_pname->pid;
+				}
+				bpf_map_update_elem(&routing_tuples_map, &tuples.five,
+						    &routing_result, BPF_ANY);
 			}
-			bpf_map_update_elem(&routing_tuples_map, &tuples.five,
-					    &routing_result, BPF_ANY);
 		}
 #if defined(__DEBUG_ROUTING) || defined(__PRINT_ROUTING_RESULT)
 		__u32 pid = pid_pname ? pid_pname->pid : 0;
@@ -2101,7 +2250,8 @@ static __always_inline int get_pid_pname(struct pid_pname *pid_pname)
 	return 0;
 }
 
-static __always_inline int _update_map_elem_by_cookie(const __u64 cookie)
+static __always_inline int _update_map_elem_by_cookie(const __u64 cookie,
+						      struct pid_pname *val)
 {
 	if (unlikely(!cookie)) {
 		bpf_printk("zero cookie");
@@ -2113,24 +2263,21 @@ static __always_inline int _update_map_elem_by_cookie(const __u64 cookie)
 	}
 
 	int ret;
-	// Build value.
-	struct pid_pname val = { 0 };
 
-	ret = get_pid_pname(&val);
+	ret = get_pid_pname(val);
 	if (ret)
 		return ret;
 
 	// Update map.
-	ret = bpf_map_update_elem(&cookie_pid_map, &cookie, &val, BPF_ANY);
+	ret = bpf_map_update_elem(&cookie_pid_map, &cookie, val, BPF_ANY);
 	if (unlikely(ret)) {
 		// bpf_printk("setup_mapping_from_sk: failed update map: %d", ret);
 		return ret;
 	}
-	bpf_map_update_elem(&tgid_pname_map, &val.pid, &val.pname, BPF_ANY);
 
 #ifdef __PRINT_SETUP_PROCESS_CONNNECTION
-	bpf_printk("setup_mapping: %llu -> %s (%d)", cookie, val.pname,
-		   val.pid);
+	bpf_printk("setup_mapping: %llu -> %s (%d)", cookie, val->pname,
+		   val->pid);
 #endif
 	return 0;
 }
@@ -2138,22 +2285,12 @@ static __always_inline int _update_map_elem_by_cookie(const __u64 cookie)
 static __always_inline int update_map_elem_by_cookie(const __u64 cookie)
 {
 	int ret;
+	struct pid_pname val = {};
 
-	ret = _update_map_elem_by_cookie(cookie);
+	ret = _update_map_elem_by_cookie(cookie, &val);
 	if (ret) {
 		// Fallback to only write pid to avoid loop due to packets sent by dae.
-		struct pid_pname val = { 0 };
-
 		val.pid = bpf_get_current_pid_tgid() >> 32;
-		__u32(*pname)[TASK_COMM_LEN] =
-			bpf_map_lookup_elem(&tgid_pname_map, &val.pid);
-		if (pname) {
-			__builtin_memcpy(val.pname, *pname, TASK_COMM_LEN);
-			ret = 0;
-			bpf_printk("fallback [retrieve pname]: %u", val.pid);
-		} else {
-			bpf_printk("failed [retrieve pname]: %u", val.pid);
-		}
 		bpf_map_update_elem(&cookie_pid_map, &cookie, &val, BPF_ANY);
 		return ret;
 	}

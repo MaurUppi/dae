@@ -6,6 +6,7 @@
 package sniffing
 
 import (
+	"encoding/binary"
 	"errors"
 	"io/fs"
 
@@ -26,6 +27,12 @@ const (
 const (
 	QuicFlag_HeaderForm_LongHeader  = 1
 	QuicFlag_LongPacketType_Initial = 0
+)
+
+const (
+	quicVersionNegotiation = 0x00000000
+	quicVersion1           = 0x00000001
+	quicVersion2           = 0x6b3343cf
 )
 
 type QuicReassemblePolicy int
@@ -54,8 +61,13 @@ func IsLikelyQuicInitialPacket(buf []byte) bool {
 	if ((protectedFlag >> QuicFlag_FixedBit) & 0b1) == 0 {
 		return false
 	}
-
-	return true
+	version := binary.BigEndian.Uint32(buf[1:5])
+	switch version {
+	case quicVersionNegotiation, quicVersion1, quicVersion2:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Sniffer) SniffQuic() (d string, err error) {

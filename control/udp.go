@@ -57,6 +57,33 @@ func ChooseNatTimeout(data []byte, sniffDns bool) (dmsg *dnsmessage.Msg, timeout
 	return nil, DefaultNatTimeout
 }
 
+func (c *ControlPlane) handleFastPathWriteFailure(realSrc, realDst netip.AddrPort, ue *UdpEndpoint, domain string, writeErr error) error {
+	debugEnabled := c != nil && c.log != nil && c.log.IsLevelEnabled(logrus.DebugLevel)
+	if debugEnabled {
+		fields := logrus.Fields{
+			"src":     realSrc.String(),
+			"dst":     realDst.String(),
+			"sniffed": domain,
+			"dead":    ue.IsDead(),
+			"err":     writeErr.Error(),
+		}
+		if ue.Outbound != nil {
+			fields["outbound"] = ue.Outbound.Name
+		}
+		if ue.Dialer != nil {
+			fields["dialer"] = ue.Dialer.Property().Name
+		}
+		c.log.WithFields(fields).Debugln("QUIC fast-path write failed")
+	}
+	if rmErr := DefaultUdpEndpointPool.Remove(realSrc, ue); rmErr != nil && debugEnabled {
+		c.log.WithError(rmErr).WithFields(logrus.Fields{
+			"src": realSrc.String(),
+			"dst": realDst.String(),
+		}).Debugln("Failed to remove UDP endpoint after fast-path write failure")
+	}
+	return fmt.Errorf("quic-fp: write udp packet request: %w", writeErr)
+}
+
 // sendPkt uses bind first, and fallback to send hdr if addr is in use.
 func sendPkt(log *logrus.Logger, data []byte, from netip.AddrPort, realTo, to netip.AddrPort, lConn *net.UDPConn) (err error) {
 	uConn, _, err := DefaultAnyfromPool.GetOrCreate(from, AnyfromTimeout)
@@ -70,7 +97,40 @@ func sendPkt(log *logrus.Logger, data []byte, from netip.AddrPort, realTo, to ne
 func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, realDst netip.AddrPort, routingResult *bpfRoutingResult, skipSniffing bool) (err error) {
 	var realSrc netip.AddrPort
 	var domain string
+	var lastNormalErr error
 	realSrc = src
+
+	// DNS Fast Path: Skip UdpEndpoint lookup for DNS traffic (port 53).
+	// DNS is a stateless protocol and doesn't need the connection tracking
+	// features that UdpEndpoint provides (designed for QUIC and other long-lived UDP).
+	// This optimization eliminates a sync.Map.Load() operation for every DNS query.
+	if realDst.Port() == 53 {
+		// Potential DNS query - verify with DNS message parsing
+		dnsMessage, _ := ChooseNatTimeout(data, true)
+		if dnsMessage != nil {
+			// Confirmed DNS request - take fast path
+			if routingResult.Mark == 0 {
+				routingResult.Mark = c.soMarkFromDae
+			}
+			req := &udpRequest{
+				realSrc:       realSrc,
+				realDst:       realDst,
+				src:           src,
+				lConn:         lConn,
+				routingResult: routingResult,
+			}
+			if err := c.dnsController.Handle_(c.ctx, dnsMessage, req); err != nil {
+				if errors.Is(err, ErrDNSQueryConcurrencyLimitExceeded) {
+					return nil
+				}
+				return err
+			}
+			return nil
+		}
+		// Not a valid DNS packet (port 53 but not DNS format) - fall through to normal UDP path
+	}
+
+	// Non-DNS traffic: use UdpEndpoint for connection tracking (QUIC, etc.)
 	ue, ueExists := DefaultUdpEndpointPool.Get(realSrc)
 	if ueExists && ue.SniffedDomain != "" {
 		// It is quic ...
@@ -96,7 +156,7 @@ func (c *ControlPlane) handlePkt(lConn *net.UDPConn, data []byte, src, pktDst, r
 
 		_, err = ue.WriteTo(data, dialTarget)
 		if err != nil {
-			return err
+			return c.handleFastPathWriteFailure(realSrc, realDst, ue, domain, err)
 		}
 		return nil
 	}
@@ -209,13 +269,22 @@ afterSniffing:
 	dialIp = true
 getNew:
 	if retry > MaxRetry {
-		c.log.WithFields(logrus.Fields{
+		fields := logrus.Fields{
 			"src":     RefineSourceToShow(realSrc, realDst.Addr()),
 			"network": networkType.String(),
-			"dialer":  ue.Dialer.Property().Name,
 			"retry":   retry,
-		}).Warnln("Touch max retry limit.")
-		return fmt.Errorf("touch max retry limit")
+		}
+		if ue != nil && ue.Dialer != nil {
+			fields["dialer"] = ue.Dialer.Property().Name
+		}
+		if lastNormalErr != nil {
+			fields["last_err"] = lastNormalErr.Error()
+		}
+		c.log.WithFields(fields).Warnln("Touch max retry limit.")
+		if lastNormalErr != nil {
+			return fmt.Errorf("normal: touch max retry limit: %w", lastNormalErr)
+		}
+		return fmt.Errorf("normal: touch max retry limit")
 	}
 	ue, isNew, err := DefaultUdpEndpointPool.GetOrCreate(realSrc, &UdpEndpointOptions{
 		// Handler handles response packets and send it to the client.
@@ -278,7 +347,7 @@ getNew:
 		},
 	})
 	if err != nil {
-		return fmt.Errorf("failed to GetOrCreate: %w", err)
+		return fmt.Errorf("normal: failed to GetOrCreate: %w", err)
 	}
 
 	// If the udp endpoint has been not alive, remove it from pool and get a new one.
@@ -292,6 +361,7 @@ getNew:
 				"retry":   retry,
 			}).Debugln("Old udp endpoint was not alive and removed.")
 		}
+		lastNormalErr = fmt.Errorf("dialer is not alive: %s", ue.Dialer.Property().Name)
 		_ = DefaultUdpEndpointPool.Remove(realSrc, ue)
 		retry++
 		goto getNew
@@ -303,6 +373,7 @@ getNew:
 
 	_, err = ue.WriteTo(data, dialTarget)
 	if err != nil {
+		lastNormalErr = fmt.Errorf("write udp packet request: %w", err)
 		if c.log.IsLevelEnabled(logrus.DebugLevel) {
 			c.log.WithFields(logrus.Fields{
 				"to":      realDst.String(),

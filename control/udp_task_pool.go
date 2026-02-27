@@ -12,7 +12,17 @@ import (
 	"time"
 )
 
-const UdpTaskQueueLength = 4096
+const (
+	// UdpTaskQueueLength is the buffer size for each UDP task queue.
+	UdpTaskQueueLength = 4096
+)
+
+var (
+	// UdpTaskPoolAgingTime is the idle timeout before a queue is garbage collected.
+	// Active flows continuously reset the timer with each packet.
+	// 100ms is sufficient for burst traffic while enabling fast memory reclamation.
+	UdpTaskPoolAgingTime = 100 * time.Millisecond
+)
 
 type UdpTask = func()
 
@@ -223,7 +233,7 @@ createNew:
 		p:         p,
 		ch:        ch,
 		wake:      make(chan struct{}, 1),
-		agingTime: DefaultNatTimeout,
+		agingTime: UdpTaskPoolAgingTime,
 	}
 
 	// LoadOrStore ensures atomic create-or-get semantics without explicit locks
@@ -233,7 +243,7 @@ createNew:
 		p.queueChPool.Put(ch)
 		q := actual.(*UdpTaskQueue)
 		if q.draining.Load() {
-			p.queues.Delete(key)
+			p.tryDeleteQueue(key, q)
 			goto createNew
 		}
 		q.refs.Add(1)
@@ -253,11 +263,7 @@ createNew:
 // tryDeleteQueue attempts to delete the queue if it's still the same instance.
 // Returns true if deletion was successful, false otherwise.
 func (p *UdpTaskPool) tryDeleteQueue(key netip.AddrPort, expected *UdpTaskQueue) bool {
-	// Use Load+Delete with verification to avoid deleting a recreated queue
-	if v, loaded := p.queues.LoadAndDelete(key); loaded {
-		return v.(*UdpTaskQueue) == expected
-	}
-	return false
+	return p.queues.CompareAndDelete(key, expected)
 }
 
 var (
