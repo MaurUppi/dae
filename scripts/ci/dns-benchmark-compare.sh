@@ -34,15 +34,30 @@ ARTIFACT_DIR="${ARTIFACT_DIR:-bench-artifacts}"
 BENCH_OVERLAY_DIR="${BENCH_OVERLAY_DIR:-}"
 BENCH_EXCLUDE_TEST_FILES="${BENCH_EXCLUDE_TEST_FILES:-}"
 KEEP_WORKTREES="${KEEP_WORKTREES:-0}"
-WORKTREE_ROOT="${WORKTREE_ROOT:-$(mktemp -d -t dae-dns-bench-XXXXXX)}"
+PROVIDED_BASE_WT="${BASE_WT:-}"
+PROVIDED_HEAD_WT="${HEAD_WT:-}"
+REUSE_WORKTREES=0
 
-BASE_WT="$WORKTREE_ROOT/base"
-HEAD_WT="$WORKTREE_ROOT/head"
+if [[ -n "$PROVIDED_BASE_WT" || -n "$PROVIDED_HEAD_WT" ]]; then
+  [[ -n "$PROVIDED_BASE_WT" && -n "$PROVIDED_HEAD_WT" ]] || die "BASE_WT and HEAD_WT must both be set when reusing worktrees"
+  [[ -d "$PROVIDED_BASE_WT" ]] || die "BASE_WT does not exist: $PROVIDED_BASE_WT"
+  [[ -d "$PROVIDED_HEAD_WT" ]] || die "HEAD_WT does not exist: $PROVIDED_HEAD_WT"
+  BASE_WT="$PROVIDED_BASE_WT"
+  HEAD_WT="$PROVIDED_HEAD_WT"
+  REUSE_WORKTREES=1
+else
+  WORKTREE_ROOT="${WORKTREE_ROOT:-$(mktemp -d -t dae-dns-bench-XXXXXX)}"
+  BASE_WT="$WORKTREE_ROOT/base"
+  HEAD_WT="$WORKTREE_ROOT/head"
+fi
 
 mkdir -p "$ARTIFACT_DIR"
 ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
 
 cleanup() {
+  if [[ "$REUSE_WORKTREES" == "1" ]]; then
+    return
+  fi
   if [[ "$KEEP_WORKTREES" == "1" ]]; then
     log "keeping worktrees at $WORKTREE_ROOT"
     return
@@ -88,8 +103,10 @@ HEAD_COMMIT="$(git rev-parse "$HEAD_REF")"
 log "base ref: $BASE_REF ($BASE_COMMIT)"
 log "head ref: $HEAD_REF ($HEAD_COMMIT)"
 
-git worktree add --detach "$BASE_WT" "$BASE_COMMIT" >/dev/null
-git worktree add --detach "$HEAD_WT" "$HEAD_COMMIT" >/dev/null
+if [[ "$REUSE_WORKTREES" == "0" ]]; then
+  git worktree add --detach "$BASE_WT" "$BASE_COMMIT" >/dev/null
+  git worktree add --detach "$HEAD_WT" "$HEAD_COMMIT" >/dev/null
+fi
 
 prepare_tree() {
   local wt="$1"
@@ -190,12 +207,14 @@ run_benchmarks() {
   )
 }
 
-prepare_tree "$BASE_WT"
-prepare_tree "$HEAD_WT"
-apply_overlay "$BASE_WT"
-apply_overlay "$HEAD_WT"
-exclude_test_files "$BASE_WT"
-exclude_test_files "$HEAD_WT"
+if [[ "$REUSE_WORKTREES" == "0" ]]; then
+  prepare_tree "$BASE_WT"
+  prepare_tree "$HEAD_WT"
+  apply_overlay "$BASE_WT"
+  apply_overlay "$HEAD_WT"
+  exclude_test_files "$BASE_WT"
+  exclude_test_files "$HEAD_WT"
+fi
 
 BASE_LIST="$ARTIFACT_DIR/base_benchmarks.txt"
 HEAD_LIST="$ARTIFACT_DIR/head_benchmarks.txt"
