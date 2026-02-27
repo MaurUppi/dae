@@ -80,12 +80,15 @@ func BenchmarkUpstreamResolver_GetUpstream_Parallel(b *testing.B) {
 	r := benchmarkInitializedResolver(b)
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
+		// Keep sink goroutine-local in the hot loop to avoid shared cache-line bouncing.
+		var sink *Upstream
 		for pb.Next() {
 			u, err := r.GetUpstream()
 			if err != nil {
 				b.Fatalf("GetUpstream failed: %v", err)
 			}
-			benchUpstreamSink = u
+			sink = u
 		}
+		benchUpstreamSink = sink
 	})
 }
