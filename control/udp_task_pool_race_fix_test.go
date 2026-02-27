@@ -101,23 +101,26 @@ func TestCompareAndDelete_AcquireQueueRace(t *testing.T) {
 
 	// Simulate two concurrent acquireQueue calls
 	var wg sync.WaitGroup
-	var q2, q3 *UdpTaskQueue
-	var createCount atomic.Int32
+	results := make(chan *UdpTaskQueue, 2)
 
 	for i := 0; i < 2; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			q := pool.acquireQueue(key)
-			createCount.Add(1)
-			if q2 == nil {
-				q2 = q
-			} else {
-				q3 = q
-			}
+			results <- pool.acquireQueue(key)
 		}()
 	}
 	wg.Wait()
+	close(results)
+
+	var queues []*UdpTaskQueue
+	for q := range results {
+		queues = append(queues, q)
+	}
+	if len(queues) != 2 {
+		t.Fatalf("expected 2 acquire results, got %d", len(queues))
+	}
+	q2, q3 := queues[0], queues[1]
 
 	// Both should get the same queue (LoadOrStore semantics)
 	if q2 != q3 {
