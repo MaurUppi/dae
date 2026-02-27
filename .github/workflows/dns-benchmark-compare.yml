@@ -82,27 +82,38 @@ jobs:
           echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
 
       - name: Run Benchmark Compare
+        env:
+          GH_EVENT_NAME: ${{ github.event_name }}
+          GH_BASE_REF: ${{ github.base_ref }}
+          GH_SHA: ${{ github.sha }}
+          INPUT_BASE_REF: ${{ github.event.inputs.base_ref }}
+          INPUT_HEAD_REF: ${{ github.event.inputs.head_ref }}
+          INPUT_BASE_STRATEGY: ${{ github.event.inputs.base_strategy }}
+          INPUT_SUITE_PROFILE: ${{ github.event.inputs.suite_profile }}
+          INPUT_SUITE_LIST: ${{ github.event.inputs.suite_list }}
+          INPUT_BENCH_COUNT: ${{ github.event.inputs.bench_count }}
+          INPUT_BENCH_TIME: ${{ github.event.inputs.bench_time }}
         run: |
           set -euo pipefail
           chmod +x scripts/ci/dns-benchmark-compare.sh
           chmod +x scripts/ci/dns-benchmark-suite-runner.sh
           mkdir -p bench-artifacts
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            BASE_REF="origin/${{ github.base_ref }}"
-            HEAD_REF="${{ github.sha }}"
+          if [[ "$GH_EVENT_NAME" == "pull_request" ]]; then
+            BASE_REF="origin/$GH_BASE_REF"
+            HEAD_REF="$GH_SHA"
             BASE_STRATEGY="merge-base"
             SUITE_PROFILE="dns-module"
             SUITE_LIST=""
             BENCH_COUNT="3"
             BENCH_TIME="200ms"
           else
-            BASE_REF="${{ github.event.inputs.base_ref }}"
-            HEAD_REF="${{ github.event.inputs.head_ref }}"
-            BASE_STRATEGY="${{ github.event.inputs.base_strategy }}"
-            SUITE_PROFILE="${{ github.event.inputs.suite_profile }}"
-            SUITE_LIST="${{ github.event.inputs.suite_list }}"
-            BENCH_COUNT="${{ github.event.inputs.bench_count }}"
-            BENCH_TIME="${{ github.event.inputs.bench_time }}"
+            BASE_REF="${INPUT_BASE_REF:-origin/main}"
+            HEAD_REF="${INPUT_HEAD_REF:-HEAD}"
+            BASE_STRATEGY="${INPUT_BASE_STRATEGY:-merge-base}"
+            SUITE_PROFILE="${INPUT_SUITE_PROFILE:-dns-module}"
+            SUITE_LIST="${INPUT_SUITE_LIST:-}"
+            BENCH_COUNT="${INPUT_BENCH_COUNT:-3}"
+            BENCH_TIME="${INPUT_BENCH_TIME:-200ms}"
           fi
 
           {
@@ -170,8 +181,18 @@ jobs:
             exit 0
           fi
 
-          # shellcheck disable=SC1090
-          source "$META_FILE"
+          meta_get() {
+            local key="$1"
+            grep -E "^${key}=" "$META_FILE" | head -n1 | cut -d= -f2-
+          }
+
+          BASE_REF="$(meta_get BASE_REF)"
+          HEAD_REF="$(meta_get HEAD_REF)"
+          BASE_STRATEGY="$(meta_get BASE_STRATEGY)"
+          SUITE_PROFILE="$(meta_get SUITE_PROFILE)"
+          SUITE_LIST="$(meta_get SUITE_LIST)"
+          BENCH_COUNT="$(meta_get BENCH_COUNT)"
+          BENCH_TIME="$(meta_get BENCH_TIME)"
 
           total=0
           passed=0
@@ -199,7 +220,8 @@ jobs:
 
             old_v="$(awk '{print $2}' <<<"$geomean_line")"
             new_v="$(awk '{print $3}' <<<"$geomean_line")"
-            delta_v="$(grep -Eo '([+-][0-9]+(\.[0-9]+)?%|[+-]?Inf%)' <<<"$geomean_line" | head -n1 || true)"
+            delta_v="$(grep -Eo '([+-][0-9]+(\.[0-9]+)?%|[+-]?Inf%|~)' <<<"$geomean_line" | head -n1 || true)"
+            [[ "$delta_v" == "~" ]] && delta_v="~ (not significant)"
             [[ -z "$old_v" ]] && old_v="n/a"
             [[ -z "$new_v" ]] && new_v="n/a"
             [[ -z "$delta_v" ]] && delta_v="n/a"
