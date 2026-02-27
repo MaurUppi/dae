@@ -108,16 +108,22 @@ jobs:
           git worktree add --detach "$base_wt" "$BASE_SHA"
           git worktree add --detach "$head_wt" "$HEAD_SHA"
 
-          (cd "$base_wt" && make ebpf)
+          (cd "$base_wt" && git submodule update --init --recursive && make ebpf) > tdd-artifacts/bench/base-prepare.log 2>&1
           base_prep_status=$?
-          (cd "$head_wt" && make ebpf)
+          (cd "$head_wt" && git submodule update --init --recursive && make ebpf) > tdd-artifacts/bench/head-prepare.log 2>&1
           head_prep_status=$?
 
           bench_failed=0
 
           if [[ $base_prep_status -ne 0 || $head_prep_status -ne 0 ]]; then
             bench_failed=1
-            echo "Benchmark prepare failed: base=$base_prep_status head=$head_prep_status" > tdd-artifacts/bench/error.log
+            {
+              echo "Benchmark prepare failed: base=$base_prep_status head=$head_prep_status"
+              echo "--- base prepare log (tail) ---"
+              tail -n 120 tdd-artifacts/bench/base-prepare.log || true
+              echo "--- head prepare log (tail) ---"
+              tail -n 120 tdd-artifacts/bench/head-prepare.log || true
+            } > tdd-artifacts/bench/error.log
           else
             suites=(
               "udp_taskpool_core|BenchmarkUdpTaskPool$"
