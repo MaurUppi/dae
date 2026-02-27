@@ -59,7 +59,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          go test -v -race -timeout 30s ./control/... -run "TestUdpTaskPool" \
+          go test -v -race -timeout 30s ./control/... -run "Test(UdpTaskPool|CompareAndDelete|NoGoroutineLeak|ConvoyExitAfterFailedDelete|HighConcurrencyStress)" \
             2>&1 | tee tdd-artifacts/taskpool-race.log
           status=${PIPESTATUS[0]}
           set -e
@@ -112,9 +112,9 @@ jobs:
             echo "### Test Status"
             echo
             if [[ "$taskpool_status" == "0" ]]; then
-              echo "- ✅ \`go test -race ./control/... -run TestUdpTaskPool\`: pass"
+              echo "- ✅ \`go test -race ./control/... -run Test(UdpTaskPool|CompareAndDelete|NoGoroutineLeak|ConvoyExitAfterFailedDelete|HighConcurrencyStress)\`: pass"
             else
-              echo "- ❌ \`go test -race ./control/... -run TestUdpTaskPool\`: failed (exit ${taskpool_status})"
+              echo "- ❌ \`go test -race ./control/... -run Test(UdpTaskPool|CompareAndDelete|NoGoroutineLeak|ConvoyExitAfterFailedDelete|HighConcurrencyStress)\`: failed (exit ${taskpool_status})"
             fi
 
             if [[ "$quic_status" == "0" ]]; then
