@@ -87,3 +87,38 @@ func TestIsLikelyQuicInitialPacket(t *testing.T) {
 		t.Fatal("packet with fixed bit cleared should not be recognized")
 	}
 }
+
+func TestIsLikelyQuicInitialPacket_VersionWhitelist(t *testing.T) {
+	cases := []struct {
+		name string
+		buf  []byte
+		want bool
+	}{
+		{
+			name: "quic_v1",
+			buf:  []byte{0xC0, 0x00, 0x00, 0x00, 0x01, 0x08, 0x00},
+			want: true,
+		},
+		{
+			name: "quic_v2",
+			buf:  []byte{0xC0, 0x6b, 0x33, 0x43, 0xcf, 0x08, 0x00},
+			want: true,
+		},
+		{
+			name: "version_negotiation",
+			buf:  []byte{0xC0, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00},
+			want: true,
+		},
+		{
+			name: "unknown_version",
+			buf:  []byte{0xC0, 0x12, 0x34, 0x56, 0x78, 0x08, 0x00},
+			want: false,
+		},
+	}
+
+	for _, tc := range cases {
+		if got := IsLikelyQuicInitialPacket(tc.buf); got != tc.want {
+			t.Fatalf("%s: got=%v want=%v", tc.name, got, tc.want)
+		}
+	}
+}

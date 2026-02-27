@@ -243,7 +243,7 @@ createNew:
 		p.queueChPool.Put(ch)
 		q := actual.(*UdpTaskQueue)
 		if q.draining.Load() {
-			p.queues.Delete(key)
+			p.tryDeleteQueue(key, q)
 			goto createNew
 		}
 		q.refs.Add(1)
@@ -263,11 +263,7 @@ createNew:
 // tryDeleteQueue attempts to delete the queue if it's still the same instance.
 // Returns true if deletion was successful, false otherwise.
 func (p *UdpTaskPool) tryDeleteQueue(key netip.AddrPort, expected *UdpTaskQueue) bool {
-	// Use Load+Delete with verification to avoid deleting a recreated queue
-	if v, loaded := p.queues.LoadAndDelete(key); loaded {
-		return v.(*UdpTaskQueue) == expected
-	}
-	return false
+	return p.queues.CompareAndDelete(key, expected)
 }
 
 var (
