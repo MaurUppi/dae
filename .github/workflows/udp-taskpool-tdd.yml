@@ -64,7 +64,7 @@ jobs:
         shell: bash
         run: |
           set +e
-          go test -v -race -timeout 30s ./control/... -run "Test(UdpTaskPool|CompareAndDelete|NoGoroutineLeak|ConvoyExitAfterFailedDelete|HighConcurrencyStress)" \
+          go test -v -race -timeout 30s ./control/... -run "Test(UdpTaskPool|CompareAndDelete|NoGoroutineLeak|ConvoyExitAfterFailedDelete|ConvoyExitsWhenQueueMappingDeletedBeforeSelfDelete|HighConcurrencyStress)" \
             2>&1 | tee tdd-artifacts/taskpool-race.log
           status=${PIPESTATUS[0]}
           set -e
