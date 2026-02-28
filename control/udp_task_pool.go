@@ -178,6 +178,14 @@ func (q *UdpTaskQueue) convoy() {
 				q.p.queueChPool.Put(q.ch)
 				return
 			}
+
+			// If mapping no longer points to this queue, this convoy became stale.
+			// Exit to avoid spinning forever outside the queue map.
+			if current, ok := q.p.queues.Load(q.key); !ok || current.(*UdpTaskQueue) != q {
+				q.p.queueChPool.Put(q.ch)
+				return
+			}
+
 			q.draining.Store(false)
 			q.safeTimerReset(timer)
 		}
