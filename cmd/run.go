@@ -37,6 +37,8 @@ import (
 	"github.com/daeuniverse/dae/control"
 	"github.com/daeuniverse/dae/pkg/config_parser"
 	"github.com/daeuniverse/dae/pkg/logger"
+	"github.com/daeuniverse/dae/pkg/metrics"
+	"github.com/daeuniverse/dae/pkg/metricshttp"
 	"github.com/mohae/deepcopy"
 	"github.com/okzk/sdnotify"
 	"github.com/sirupsen/logrus"
@@ -128,18 +130,35 @@ func Run(log *logrus.Logger, conf *config.Config, externGeoDataDirs []string) (e
 	// Remove AbortFile at beginning.
 	_ = os.Remove(AbortFile)
 
+	endpointCfg := endpointConfigFromGlobal(conf, log)
+	if err = validateEndpointTLSFiles(endpointCfg); err != nil {
+		return fmt.Errorf("invalid endpoint tls config: %w", err)
+	}
+
 	// New ControlPlane.
 	c, err := newControlPlane(log, nil, nil, conf, externGeoDataDirs)
 	if err != nil {
 		return err
 	}
 
-	var pprofServer *http.Server
-	if conf.Global.PprofPort != 0 {
-		pprofAddr := fmt.Sprintf("localhost:%d", conf.Global.PprofPort)
-		pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
-		go pprofServer.ListenAndServe()
+	metricsState := metrics.NewState()
+	metricsState.SetControlPlane(c)
+	metricsRegistry := metrics.NewRegistry(metricsState)
+
+	var endpointServer *http.Server
+	startEndpointServer := func(cfg metricshttp.EndpointConfig) {
+		if cfg.ListenAddress == "" {
+			endpointServer = nil
+			return
+		}
+		endpointServer = metricshttp.NewEndpointServer(cfg, metricsRegistry)
+		go func(server *http.Server, endpointCfg metricshttp.EndpointConfig) {
+			if e := metricshttp.StartEndpointServer(server, endpointCfg); e != nil && !errors.Is(e, http.ErrServerClosed) {
+				log.WithError(e).Errorln("Endpoint server stopped with error")
+			}
+		}(endpointServer, cfg)
 	}
+	startEndpointServer(endpointCfg)
 
 	// Serve tproxy TCP/UDP server util signals.
 	var listener *control.Listener
@@ -252,6 +271,16 @@ loop:
 			log.SetOutput(oldLogOutput) // FIXME: THIS IS A HACK.
 			logrus.SetOutput(oldLogOutput)
 
+			newEndpointCfg := endpointConfigFromGlobal(newConf, log)
+			if err = validateEndpointTLSFiles(newEndpointCfg); err != nil {
+				log.WithFields(logrus.Fields{
+					"err": err,
+				}).Errorln("[Reload] Failed to reload")
+				sdnotify.Ready()
+				_ = os.WriteFile(SignalProgressFilePath, append([]byte{consts.ReloadError}, []byte("\n"+err.Error())...), 0644)
+				continue
+			}
+
 			// New control plane.
 			obj := c.EjectBpf()
 			var dnsCache map[string]*control.DnsCache
@@ -263,7 +292,7 @@ loop:
 			if err := c.StopDNSListener(); err != nil {
 				log.Warnf("[Reload] Failed to stop old DNS listener: %v", err)
 			}
-			
+
 			log.Warnln("[Reload] Load new control plane")
 			newC, err := newControlPlane(log, obj, dnsCache, newConf, externGeoDataDirs)
 			if err != nil {
@@ -295,6 +324,7 @@ loop:
 			c = newC
 			conf = newConf
 			reloading = true
+			metricsState.SetControlPlane(newC)
 
 			// Ready to close.
 			if abortConnections {
@@ -302,14 +332,12 @@ loop:
 			}
 			oldC.Close()
 
-			if pprofServer != nil {
-				pprofServer.Shutdown(context.Background())
-				pprofServer = nil
-			}
-			if newConf.Global.PprofPort != 0 {
-				pprofAddr := fmt.Sprintf("localhost:%d", conf.Global.PprofPort)
-				pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
-				go pprofServer.ListenAndServe()
+			if endpointConfigChanged(endpointCfg, newEndpointCfg) {
+				if endpointServer != nil {
+					_ = endpointServer.Shutdown(context.Background())
+				}
+				endpointCfg = newEndpointCfg
+				startEndpointServer(endpointCfg)
 			}
 		case syscall.SIGHUP:
 			// Ignore.
@@ -321,6 +349,9 @@ loop:
 	}
 	defer os.Remove(PidFilePath)
 	defer control.GetDaeNetns().Close()
+	if endpointServer != nil {
+		_ = endpointServer.Shutdown(context.Background())
+	}
 	if e := c.Close(); e != nil {
 		return fmt.Errorf("close control plane: %w", e)
 	}

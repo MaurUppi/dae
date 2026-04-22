@@ -1,7 +1,7 @@
 /*
 *  SPDX-License-Identifier: AGPL-3.0-only
 *  Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
-*/
+ */
 
 package control
 
@@ -55,6 +55,12 @@ func NewUdpTaskPool() *UdpTaskPool {
 		m:  map[string]*UdpTaskQueue{},
 	}
 	return p
+}
+
+func (p *UdpTaskPool) Count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.m)
 }
 
 // EmitTask: Make sure packets with the same key (4 tuples) will be sent in order.
