@@ -23,11 +23,13 @@ on:
       - "go.sum"
       - ".github/workflows/build.yml"
       - ".github/workflows/seed-build.yml"
+      - ".github/workflows/pre-actions.local.yml"
+      - ".github/workflows/dae-post-actions.local.yml"
       - "Makefile"
 
 jobs:
   pre-actions:
-    uses: daeuniverse/ci-seed-jobs/.github/workflows/pre-actions.yml@master
+    uses: ./.github/workflows/pre-actions.local.yml
     with:
       repository: ${{ github.repository }}
       ref: ${{ github.sha }}
@@ -36,7 +38,7 @@ jobs:
     secrets: inherit
 
   build:
-    uses: daeuniverse/dae/.github/workflows/seed-build.yml@main
+    uses: ./.github/workflows/seed-build.yml
     with:
       ref: ${{ github.sha }}
       build-type: main-build
@@ -45,7 +47,7 @@ jobs:
   post-actions:
     if: always()
     needs: [build]
-    uses: daeuniverse/ci-seed-jobs/.github/workflows/dae-post-actions.yml@master
+    uses: ./.github/workflows/dae-post-actions.local.yml
     with:
       check-run-id: "dae-bot[bot]/main-build-passed"
       check-run-conclusion: ${{ needs.build.result }}
