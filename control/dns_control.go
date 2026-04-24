@@ -82,12 +82,11 @@ type DnsController struct {
 	dnsForwarderCacheMu sync.Mutex
 	dnsForwarderCache   map[dnsForwarderKey]DnsForwarder
 
-	dnsMetricsInit       sync.Once
-	dnsQueryTotal        atomic.Uint64
-	dnsCacheHitTotal     atomic.Uint64
-	dnsCacheLazyHitTotal atomic.Uint64
-	dnsCacheMissTotal    atomic.Uint64
-	dnsRejectedTotal     atomic.Uint64
+	dnsMetricsInit    sync.Once
+	dnsQueryTotal     atomic.Uint64
+	dnsCacheHitTotal  atomic.Uint64
+	dnsCacheMissTotal atomic.Uint64
+	dnsRejectedTotal  atomic.Uint64
 	dnsRefusedTotal      atomic.Uint64
 	dnsResponseLatency   *dnsLatencyHistogram
 	dnsUpstreamMetrics   sync.Map
@@ -418,10 +417,18 @@ func (c *DnsController) HandleWithResponseWriter_(dnsMessage *dnsmessage.Msg, re
 	switch qtype {
 	case dnsmessage.TypeA, dnsmessage.TypeAAAA:
 		if c.qtypePrefer == 0 {
-			return c.handleWithResponseWriter_(dnsMessage, req, true, responseWriter)
+			hit, err := c.handleWithResponseWriter_(dnsMessage, req, true, responseWriter)
+			if hit {
+				c.dnsCacheHitTotal.Add(1)
+			}
+			return err
 		}
 	default:
-		return c.handleWithResponseWriter_(dnsMessage, req, true, responseWriter)
+		hit, err := c.handleWithResponseWriter_(dnsMessage, req, true, responseWriter)
+		if hit {
+			c.dnsCacheHitTotal.Add(1)
+		}
+		return err
 	}
 
 	// Try to make both A and AAAA lookups.
@@ -440,11 +447,15 @@ func (c *DnsController) HandleWithResponseWriter_(dnsMessage *dnsmessage.Msg, re
 
 	done := make(chan struct{})
 	go func() {
-		_ = c.handleWithResponseWriter_(dnsMessage2, req, false, responseWriter)
+		_, _ = c.handleWithResponseWriter_(dnsMessage2, req, false, responseWriter)
 		done <- struct{}{}
 	}()
-	err = c.handleWithResponseWriter_(dnsMessage, req, false, responseWriter)
+	var hit bool
+	hit, err = c.handleWithResponseWriter_(dnsMessage, req, false, responseWriter)
 	<-done
+	if hit {
+		c.dnsCacheHitTotal.Add(1)
+	}
 	if err != nil {
 		return err
 	}
@@ -479,7 +490,8 @@ func (c *DnsController) handle_(
 	req *udpRequest,
 	needResp bool,
 ) (err error) {
-	return c.handleWithResponseWriter_(dnsMessage, req, needResp, nil)
+	_, err = c.handleWithResponseWriter_(dnsMessage, req, needResp, nil)
+	return
 }
 
 func (c *DnsController) handleWithResponseWriter_(
@@ -487,7 +499,7 @@ func (c *DnsController) handleWithResponseWriter_(
 	req *udpRequest,
 	needResp bool,
 	responseWriter dnsmessage.ResponseWriter,
-) (err error) {
+) (cacheHit bool, err error) {
 	// Prepare qname, qtype.
 	var qname string
 	var qtype uint16
@@ -500,7 +512,7 @@ func (c *DnsController) handleWithResponseWriter_(
 	// Route request.
 	upstreamIndex, upstream, err := c.routing.RequestSelect(qname, qtype)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	cacheKey := c.cacheKey(qname, qtype)
@@ -508,7 +520,7 @@ func (c *DnsController) handleWithResponseWriter_(
 	if upstreamIndex == consts.DnsRequestOutboundIndex_Reject {
 		// Reject with empty answer.
 		c.RemoveDnsRespCache(cacheKey)
-		return c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
+		return false, c.sendRejectWithResponseWriter_(dnsMessage, req, responseWriter)
 	}
 
 	// No parallel for the same lookup.
@@ -525,18 +537,17 @@ func (c *DnsController) handleWithResponseWriter_(
 	}()
 
 	if resp := c.LookupDnsRespCache_(dnsMessage, cacheKey, false); resp != nil {
-		c.dnsCacheHitTotal.Add(1)
 		// Send cache to client directly.
 		if needResp {
 			if responseWriter != nil {
 				var respMsg dnsmessage.Msg
 				if err = respMsg.Unpack(resp); err != nil {
-					return fmt.Errorf("failed to unpack DNS response: %w", err)
+					return true, fmt.Errorf("failed to unpack DNS response: %w", err)
 				}
-				return responseWriter.WriteMsg(&respMsg)
+				return true, responseWriter.WriteMsg(&respMsg)
 			}
 			if err = sendPkt(c.log, resp, req.realDst, req.realSrc, req.src, req.lConn); err != nil {
-				return fmt.Errorf("failed to write cached DNS resp: %w", err)
+				return true, fmt.Errorf("failed to write cached DNS resp: %w", err)
 			}
 		}
 		if c.log.IsLevelEnabled(logrus.DebugLevel) && len(dnsMessage.Question) > 0 {
@@ -545,7 +556,7 @@ func (c *DnsController) handleWithResponseWriter_(
 				RefineSourceToShow(req.realSrc, req.realDst.Addr()), strings.ToLower(q.Name), QtypeToString(q.Qtype),
 			)
 		}
-		return nil
+		return true, nil
 	}
 	c.dnsCacheMissTotal.Add(1)
 
@@ -563,9 +574,9 @@ func (c *DnsController) handleWithResponseWriter_(
 	// Re-pack DNS packet.
 	data, err := dnsMessage.Pack()
 	if err != nil {
-		return fmt.Errorf("pack DNS packet: %w", err)
+		return false, fmt.Errorf("pack DNS packet: %w", err)
 	}
-	return c.dialSend(0, req, data, dnsMessage.Id, upstream, needResp)
+	return false, c.dialSend(0, req, data, dnsMessage.Id, upstream, needResp)
 }
 
 // sendReject_ send empty answer.

@@ -19,10 +19,9 @@ type DnsCollector struct {
 	concurrencyLimit  *prometheus.Desc
 	forwarderCache    *prometheus.Desc
 	forwarderInFlight *prometheus.Desc
-	queryTotal        *prometheus.Desc
-	cacheHitTotal     *prometheus.Desc
-	cacheLazyHitTotal *prometheus.Desc
-	cacheMissTotal    *prometheus.Desc
+	queryTotal    *prometheus.Desc
+	cacheHitTotal *prometheus.Desc
+	cacheMissTotal *prometheus.Desc
 	upstreamQuery     *prometheus.Desc
 	upstreamErr       *prometheus.Desc
 	rejectedTotal     *prometheus.Desc
@@ -73,12 +72,6 @@ func NewDnsCollector(state *State) *DnsCollector {
 		cacheHitTotal: prometheus.NewDesc(
 			"dae_dns_cache_hit_total",
 			"Total number of fresh DNS cache hits",
-			nil,
-			nil,
-		),
-		cacheLazyHitTotal: prometheus.NewDesc(
-			"dae_dns_cache_lazy_hit_total",
-			"Total number of stale DNS cache responses served while refreshing in background",
 			nil,
 			nil,
 		),
@@ -135,7 +128,6 @@ func (c *DnsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.forwarderInFlight
 	ch <- c.queryTotal
 	ch <- c.cacheHitTotal
-	ch <- c.cacheLazyHitTotal
 	ch <- c.cacheMissTotal
 	ch <- c.upstreamQuery
 	ch <- c.upstreamErr
@@ -183,7 +175,6 @@ func (c *DnsCollector) Collect(ch chan<- prometheus.Metric) {
 	counters := dc.DnsCountersSnapshot()
 	ch <- prometheus.MustNewConstMetric(c.queryTotal, prometheus.CounterValue, float64(counters.QueryTotal))
 	ch <- prometheus.MustNewConstMetric(c.cacheHitTotal, prometheus.CounterValue, float64(counters.CacheHitTotal))
-	ch <- prometheus.MustNewConstMetric(c.cacheLazyHitTotal, prometheus.CounterValue, float64(counters.CacheLazyHitTotal))
 	ch <- prometheus.MustNewConstMetric(c.cacheMissTotal, prometheus.CounterValue, float64(counters.CacheMissTotal))
 	ch <- prometheus.MustNewConstMetric(c.rejectedTotal, prometheus.CounterValue, float64(counters.RejectedTotal))
 	ch <- prometheus.MustNewConstMetric(c.refusedTotal, prometheus.CounterValue, float64(counters.RefusedTotal))

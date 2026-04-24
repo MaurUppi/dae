@@ -25,7 +25,6 @@ type DnsHistogramSnapshot struct {
 type DnsCountersSnapshot struct {
 	QueryTotal         uint64
 	CacheHitTotal      uint64
-	CacheLazyHitTotal  uint64
 	CacheMissTotal     uint64
 	UpstreamQueryTotal uint64
 	UpstreamErrTotal   uint64
@@ -157,7 +156,6 @@ func (c *DnsController) DnsCountersSnapshot() DnsCountersSnapshot {
 	return DnsCountersSnapshot{
 		QueryTotal:         c.dnsQueryTotal.Load(),
 		CacheHitTotal:      c.dnsCacheHitTotal.Load(),
-		CacheLazyHitTotal:  c.dnsCacheLazyHitTotal.Load(),
 		CacheMissTotal:     c.dnsCacheMissTotal.Load(),
 		UpstreamQueryTotal: upstreamQueryTotal,
 		UpstreamErrTotal:   upstreamErrTotal,
