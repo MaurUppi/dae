@@ -25,7 +25,7 @@ type DnsHistogramSnapshot struct {
 type DnsCountersSnapshot struct {
 	QueryTotal         uint64
 	CacheHitTotal      uint64
-	CacheMissTotal     uint64
+	CacheLazyHitTotal  uint64
 	UpstreamQueryTotal uint64
 	UpstreamErrTotal   uint64
 	RejectedTotal      uint64
@@ -35,6 +35,7 @@ type DnsCountersSnapshot struct {
 type DnsUpstreamMetricsSnapshot struct {
 	QueryTotal uint64
 	ErrTotal   uint64
+	InFlight   int32
 	Latency    DnsHistogramSnapshot
 }
 
@@ -47,6 +48,7 @@ type dnsLatencyHistogram struct {
 type dnsUpstreamMetric struct {
 	queryTotal atomic.Uint64
 	errTotal   atomic.Uint64
+	inFlight   atomic.Int32
 	latency    *dnsLatencyHistogram
 }
 
@@ -156,7 +158,7 @@ func (c *DnsController) DnsCountersSnapshot() DnsCountersSnapshot {
 	return DnsCountersSnapshot{
 		QueryTotal:         c.dnsQueryTotal.Load(),
 		CacheHitTotal:      c.dnsCacheHitTotal.Load(),
-		CacheMissTotal:     c.dnsCacheMissTotal.Load(),
+		CacheLazyHitTotal:  c.dnsCacheLazyHitTotal.Load(),
 		UpstreamQueryTotal: upstreamQueryTotal,
 		UpstreamErrTotal:   upstreamErrTotal,
 		RejectedTotal:      c.dnsRejectedTotal.Load(),
@@ -184,6 +186,7 @@ func (c *DnsController) DnsUpstreamSnapshot() map[string]DnsUpstreamMetricsSnaps
 		snapshot[upstream] = DnsUpstreamMetricsSnapshot{
 			QueryTotal: metric.queryTotal.Load(),
 			ErrTotal:   metric.errTotal.Load(),
+			InFlight:   metric.inFlight.Load(),
 			Latency:    metric.latency.Snapshot(),
 		}
 		return true

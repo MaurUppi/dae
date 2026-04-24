@@ -36,6 +36,13 @@ func requireDescriptor(t *testing.T, names map[string]struct{}, name string) {
 	}
 }
 
+func requireNoDescriptor(t *testing.T, names map[string]struct{}, name string) {
+	t.Helper()
+	if _, ok := names[name]; ok {
+		t.Fatalf("unexpected descriptor %q", name)
+	}
+}
+
 func requireDescriptors(t *testing.T, names map[string]struct{}, expected []string) {
 	t.Helper()
 	for _, name := range expected {
@@ -48,13 +55,11 @@ func TestDnsCollectorDescribeIncludesPhase2Descriptors(t *testing.T) {
 	requireDescriptors(t, names, []string{
 		"dae_dns_cache_entries",
 		"dae_dns_concurrency_in_use",
-		"dae_dns_concurrency_limit",
 		"dae_dns_forwarder_cache_entries",
 		"dae_dns_forwarder_in_flight",
 		"dae_dns_query_total",
 		"dae_dns_cache_hit_total",
 		"dae_dns_cache_lazy_hit_total",
-		"dae_dns_cache_miss_total",
 		"dae_dns_upstream_query_total",
 		"dae_dns_upstream_err_total",
 		"dae_dns_rejected_total",
@@ -62,6 +67,8 @@ func TestDnsCollectorDescribeIncludesPhase2Descriptors(t *testing.T) {
 		"dae_dns_response_latency_seconds",
 		"dae_dns_upstream_latency_seconds",
 	})
+	requireNoDescriptor(t, names, "dae_dns_concurrency_limit")
+	requireNoDescriptor(t, names, "dae_dns_cache_miss_total")
 }
 
 func TestDialerCollectorDescribeIncludesPhase2Descriptors(t *testing.T) {

@@ -16,12 +16,11 @@ type DnsCollector struct {
 
 	cacheEntries      *prometheus.Desc
 	concurrencyInUse  *prometheus.Desc
-	concurrencyLimit  *prometheus.Desc
 	forwarderCache    *prometheus.Desc
 	forwarderInFlight *prometheus.Desc
-	queryTotal    *prometheus.Desc
-	cacheHitTotal *prometheus.Desc
-	cacheMissTotal *prometheus.Desc
+	queryTotal        *prometheus.Desc
+	cacheHitTotal     *prometheus.Desc
+	cacheLazyHitTotal *prometheus.Desc
 	upstreamQuery     *prometheus.Desc
 	upstreamErr       *prometheus.Desc
 	rejectedTotal     *prometheus.Desc
@@ -41,13 +40,7 @@ func NewDnsCollector(state *State) *DnsCollector {
 		),
 		concurrencyInUse: prometheus.NewDesc(
 			"dae_dns_concurrency_in_use",
-			"The number of DNS query slots currently in use",
-			nil,
-			nil,
-		),
-		concurrencyLimit: prometheus.NewDesc(
-			"dae_dns_concurrency_limit",
-			"The maximum number of concurrent DNS queries allowed",
+			"The number of client DNS queries currently being handled by dae",
 			nil,
 			nil,
 		),
@@ -75,9 +68,9 @@ func NewDnsCollector(state *State) *DnsCollector {
 			nil,
 			nil,
 		),
-		cacheMissTotal: prometheus.NewDesc(
-			"dae_dns_cache_miss_total",
-			"Total number of DNS cache misses",
+		cacheLazyHitTotal: prometheus.NewDesc(
+			"dae_dns_cache_lazy_hit_total",
+			"Total number of stale DNS cache responses served while refreshing in background. Always 0 until stale-while-revalidate is implemented.",
 			nil,
 			nil,
 		),
@@ -123,12 +116,11 @@ func NewDnsCollector(state *State) *DnsCollector {
 func (c *DnsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cacheEntries
 	ch <- c.concurrencyInUse
-	ch <- c.concurrencyLimit
 	ch <- c.forwarderCache
 	ch <- c.forwarderInFlight
 	ch <- c.queryTotal
 	ch <- c.cacheHitTotal
-	ch <- c.cacheMissTotal
+	ch <- c.cacheLazyHitTotal
 	ch <- c.upstreamQuery
 	ch <- c.upstreamErr
 	ch <- c.rejectedTotal
@@ -151,31 +143,15 @@ func (c *DnsCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	ch <- prometheus.MustNewConstMetric(c.cacheEntries, prometheus.GaugeValue, float64(dc.CacheSize()))
-	inUse, limit := dc.ConcurrencyInfo()
-	ch <- prometheus.MustNewConstMetric(c.concurrencyInUse, prometheus.GaugeValue, float64(inUse))
-	ch <- prometheus.MustNewConstMetric(c.concurrencyLimit, prometheus.GaugeValue, float64(limit))
+	ch <- prometheus.MustNewConstMetric(c.concurrencyInUse, prometheus.GaugeValue, float64(dc.ConcurrencyInUse()))
 
-	forwarderCount, inFlightByUpstream := dc.ForwarderCacheInfo()
+	forwarderCount := dc.ForwarderCacheInfo()
 	ch <- prometheus.MustNewConstMetric(c.forwarderCache, prometheus.GaugeValue, float64(forwarderCount))
-
-	upstreams := make([]string, 0, len(inFlightByUpstream))
-	for upstream := range inFlightByUpstream {
-		upstreams = append(upstreams, upstream)
-	}
-	sort.Strings(upstreams)
-	for _, upstream := range upstreams {
-		ch <- prometheus.MustNewConstMetric(
-			c.forwarderInFlight,
-			prometheus.GaugeValue,
-			float64(inFlightByUpstream[upstream]),
-			upstream,
-		)
-	}
 
 	counters := dc.DnsCountersSnapshot()
 	ch <- prometheus.MustNewConstMetric(c.queryTotal, prometheus.CounterValue, float64(counters.QueryTotal))
 	ch <- prometheus.MustNewConstMetric(c.cacheHitTotal, prometheus.CounterValue, float64(counters.CacheHitTotal))
-	ch <- prometheus.MustNewConstMetric(c.cacheMissTotal, prometheus.CounterValue, float64(counters.CacheMissTotal))
+	ch <- prometheus.MustNewConstMetric(c.cacheLazyHitTotal, prometheus.CounterValue, float64(counters.CacheLazyHitTotal))
 	ch <- prometheus.MustNewConstMetric(c.rejectedTotal, prometheus.CounterValue, float64(counters.RejectedTotal))
 	ch <- prometheus.MustNewConstMetric(c.refusedTotal, prometheus.CounterValue, float64(counters.RefusedTotal))
 
@@ -190,6 +166,7 @@ func (c *DnsCollector) Collect(ch chan<- prometheus.Metric) {
 	sort.Strings(upstreamKeys)
 	for _, upstream := range upstreamKeys {
 		snapshot := upstreamSnapshot[upstream]
+		ch <- prometheus.MustNewConstMetric(c.forwarderInFlight, prometheus.GaugeValue, float64(snapshot.InFlight), upstream)
 		ch <- prometheus.MustNewConstMetric(c.upstreamQuery, prometheus.CounterValue, float64(snapshot.QueryTotal), upstream)
 		ch <- prometheus.MustNewConstMetric(c.upstreamErr, prometheus.CounterValue, float64(snapshot.ErrTotal), upstream)
 		ch <- prometheus.MustNewConstHistogram(

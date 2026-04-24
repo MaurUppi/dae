@@ -73,6 +73,9 @@ func TestDnsControllerRejectCounter(t *testing.T) {
 	if counters.RejectedTotal != 1 {
 		t.Fatalf("unexpected rejected counter: got=%d want=1", counters.RejectedTotal)
 	}
+	if counters.CacheLazyHitTotal != 0 {
+		t.Fatalf("unexpected lazy cache hit counter: got=%d want=0", counters.CacheLazyHitTotal)
+	}
 	if counters.RefusedTotal != 0 {
 		t.Fatalf("unexpected refused counter: got=%d want=0", counters.RefusedTotal)
 	}
@@ -83,6 +86,7 @@ func TestDnsControllerUpstreamSnapshot(t *testing.T) {
 	metric := c.getOrCreateDnsUpstreamMetric("udp://1.1.1.1:53")
 	metric.queryTotal.Add(2)
 	metric.errTotal.Add(1)
+	metric.inFlight.Add(3)
 	metric.latency.Observe(0.01)
 	metric.latency.Observe(0.02)
 
@@ -96,6 +100,9 @@ func TestDnsControllerUpstreamSnapshot(t *testing.T) {
 	}
 	if entry.ErrTotal != 1 {
 		t.Fatalf("unexpected upstream err total: got=%d want=1", entry.ErrTotal)
+	}
+	if entry.InFlight != 3 {
+		t.Fatalf("unexpected upstream in-flight: got=%d want=3", entry.InFlight)
 	}
 	if entry.Latency.Count != 2 {
 		t.Fatalf("unexpected upstream latency count: got=%d want=2", entry.Latency.Count)
@@ -126,9 +133,9 @@ func TestDnsControllerHandleWithResponseWriterCountsQuery(t *testing.T) {
 
 func TestDnsControllerConcurrencyInfo(t *testing.T) {
 	c := &DnsController{}
+	c.dnsConcurrencyInFlight.Add(2)
 
-	inUse, limit := c.ConcurrencyInfo()
-	if limit != 0 || inUse != 0 {
-		t.Fatalf("unexpected legacy concurrency info: inUse=%d limit=%d", inUse, limit)
+	if inUse := c.ConcurrencyInUse(); inUse != 2 {
+		t.Fatalf("unexpected concurrency in-use: got=%d want=2", inUse)
 	}
 }

@@ -34,6 +34,7 @@ global {
     #endpoint_listen_address: '0.0.0.0:5556'
     #endpoint_username: ''
     #endpoint_password: ''
+    # TLS permission policy: certificate must be 0640 or 0644; private key must be 0600.
     #endpoint_tls_certificate: ''
     #endpoint_tls_key: ''
     #endpoint_prometheus_enabled: true

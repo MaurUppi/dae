@@ -82,14 +82,15 @@ type DnsController struct {
 	dnsForwarderCacheMu sync.Mutex
 	dnsForwarderCache   map[dnsForwarderKey]DnsForwarder
 
-	dnsMetricsInit    sync.Once
-	dnsQueryTotal     atomic.Uint64
-	dnsCacheHitTotal  atomic.Uint64
-	dnsCacheMissTotal atomic.Uint64
-	dnsRejectedTotal  atomic.Uint64
-	dnsRefusedTotal      atomic.Uint64
-	dnsResponseLatency   *dnsLatencyHistogram
-	dnsUpstreamMetrics   sync.Map
+	dnsMetricsInit         sync.Once
+	dnsQueryTotal          atomic.Uint64
+	dnsCacheHitTotal       atomic.Uint64
+	dnsCacheLazyHitTotal   atomic.Uint64
+	dnsConcurrencyInFlight atomic.Int64
+	dnsRejectedTotal       atomic.Uint64
+	dnsRefusedTotal        atomic.Uint64
+	dnsResponseLatency     *dnsLatencyHistogram
+	dnsUpstreamMetrics     sync.Map
 }
 
 type handlingState struct {
@@ -143,14 +144,14 @@ func (c *DnsController) CacheSize() int {
 	return len(c.dnsCache)
 }
 
-func (c *DnsController) ConcurrencyInfo() (inUse, limit int) {
-	return 0, 0
+func (c *DnsController) ConcurrencyInUse() int {
+	return int(c.dnsConcurrencyInFlight.Load())
 }
 
-func (c *DnsController) ForwarderCacheInfo() (count int, inFlightByUpstream map[string]int32) {
+func (c *DnsController) ForwarderCacheInfo() (count int) {
 	c.dnsForwarderCacheMu.Lock()
 	defer c.dnsForwarderCacheMu.Unlock()
-	return len(c.dnsForwarderCache), map[string]int32{}
+	return len(c.dnsForwarderCache)
 }
 
 func (c *DnsController) cacheKey(qname string, qtype uint16) string {
@@ -389,6 +390,8 @@ func (c *DnsController) Handle_(dnsMessage *dnsmessage.Msg, req *udpRequest) (er
 
 func (c *DnsController) HandleWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
 	c.dnsQueryTotal.Add(1)
+	c.dnsConcurrencyInFlight.Add(1)
+	defer c.dnsConcurrencyInFlight.Add(-1)
 	start := time.Now()
 	defer func() {
 		c.observeDnsResponseLatency(time.Since(start))
@@ -558,8 +561,6 @@ func (c *DnsController) handleWithResponseWriter_(
 		}
 		return true, nil
 	}
-	c.dnsCacheMissTotal.Add(1)
-
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
 		upstreamName := upstreamIndex.String()
 		if upstream != nil {
@@ -704,7 +705,11 @@ func (c *DnsController) dialSend(invokingDepth int, req *udpRequest, data []byte
 	}
 
 	forwardStart := time.Now()
-	respMsg, err = forwarder.ForwardDNS(ctxDial, data)
+	upstreamMetric.inFlight.Add(1)
+	respMsg, err = func() (*dnsmessage.Msg, error) {
+		defer upstreamMetric.inFlight.Add(-1)
+		return forwarder.ForwardDNS(ctxDial, data)
+	}()
 	upstreamMetric.latency.Observe(time.Since(forwardStart).Seconds())
 	if err != nil {
 		upstreamMetric.errTotal.Add(1)
