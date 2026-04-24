@@ -129,6 +129,17 @@ type dnsControllerStore struct {
 	// When ip_version_prefer is set, non-preferred responses wait briefly
 	// for preferred responses to arrive (RFC 8305 Happy Eyeballs).
 	prefWaitRegistry *preferenceWaitRegistry
+
+	// DNS metrics — on store so they persist across reloads.
+	dnsMetricsInit         sync.Once
+	dnsQueryTotal          atomic.Uint64
+	dnsCacheHitTotal       atomic.Uint64
+	dnsCacheLazyHitTotal   atomic.Uint64
+	dnsConcurrencyInFlight atomic.Int64
+	dnsRejectedTotal       atomic.Uint64
+	dnsRefusedTotal        atomic.Uint64
+	dnsResponseLatency     *dnsLatencyHistogram
+	dnsUpstreamMetrics     sync.Map
 }
 
 // DnsController is a lightweight generation-local facade over a shared
@@ -629,6 +640,27 @@ func (c *DnsController) ResetDnsForwarders() error {
 	// Retire cached forwarders so new requests redial using the replacement
 	// generation's runtime, while in-flight upstream exchanges finish cleanly.
 	return errors.Join(c.retireAllDnsForwarders()...)
+}
+
+func (c *DnsController) CacheSize() int {
+	n := 0
+	c.requireStore().dnsCache.Range(func(_, _ any) bool {
+		n++
+		return true
+	})
+	return n
+}
+
+func (c *DnsController) ConcurrencyInUse() int {
+	return int(c.dnsConcurrencyInFlight.Load())
+}
+
+func (c *DnsController) ForwarderCacheInfo() (count int) {
+	c.requireStore().dnsForwarderCache.Range(func(_, _ any) bool {
+		count++
+		return true
+	})
+	return count
 }
 
 var (
@@ -2170,6 +2202,11 @@ func (c *DnsController) Handle_(ctx context.Context, dnsMessage *dnsmessage.Msg,
 
 func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
 	c.requireStore()
+	c.dnsQueryTotal.Add(1)
+	c.dnsConcurrencyInFlight.Add(1)
+	defer c.dnsConcurrencyInFlight.Add(-1)
+	start := time.Now()
+	defer func() { c.observeDnsResponseLatency(time.Since(start)) }()
 	var upstreamIndex consts.DnsRequestOutboundIndex
 	var upstream *dns.Upstream
 
@@ -2222,9 +2259,11 @@ func (c *DnsController) HandleWithResponseWriter_(ctx context.Context, dnsMessag
 
 		// Check cache after routing (non-reject case)
 		if resp, needRefresh := c.LookupDnsRespCache_(dnsMessage, responseCacheKey, false); resp != nil {
+			c.dnsCacheHitTotal.Add(1)
 			// Cache hit - return immediately without singleflight
 			// OPTIMISTIC CACHE: resp may be stale, trigger background refresh if needed
 			if needRefresh {
+				c.dnsCacheLazyHitTotal.Add(1)
 				// Background refresh - don't block the current request
 				go c.backgroundRefresh(responseCacheKey, dnsMessage, req, upstreamIndex, upstream)
 			}
@@ -2448,9 +2487,8 @@ func (c *DnsController) handleWithResponseWriter_(
 				c.log.Debugf("UDP(DNS) Cache: %v %v", strings.ToLower(q.Name), QtypeToString(q.Qtype))
 			}
 		}
-		return nil
+		return true, nil
 	}
-
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
 		upstreamName := upstreamIndex.String()
 		if upstream != nil {
@@ -2465,7 +2503,7 @@ func (c *DnsController) handleWithResponseWriter_(
 	// Re-pack DNS packet.
 	data, err := dnsMessage.Pack()
 	if err != nil {
-		return fmt.Errorf("pack DNS packet: %w", err)
+		return false, fmt.Errorf("pack DNS packet: %w", err)
 	}
 	return c.dialSend(ctx, 0, req, data, dnsMessage.Id, upstream, needResp, responseWriter, responseCacheKey, baseCacheKey)
 }
@@ -2584,6 +2622,7 @@ func (c *DnsController) sendDnsErrorResponse_(
 
 // sendRefusedWithResponseWriter_ sends REFUSED response when overload protection is triggered.
 func (c *DnsController) sendRefusedWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
+	c.dnsRefusedTotal.Add(1)
 	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeRefused, "Refused due to concurrency limit", req, responseWriter)
 }
 
@@ -2617,6 +2656,7 @@ func (c *DnsController) sendDnsTruncatedResponse_(dnsMessage *dnsmessage.Msg, re
 
 // sendRejectWithResponseWriter_ send empty answer.
 func (c *DnsController) sendRejectWithResponseWriter_(dnsMessage *dnsmessage.Msg, req *udpRequest, responseWriter dnsmessage.ResponseWriter) (err error) {
+	c.dnsRejectedTotal.Add(1)
 	return c.sendDnsErrorResponse_(dnsMessage, dnsmessage.RcodeSuccess, "Reject", req, responseWriter)
 }
 
@@ -2728,6 +2768,8 @@ func (c *DnsController) dialSend(
 	} else {
 		upstreamName = upstream.String()
 	}
+	upstreamMetric := c.getOrCreateDnsUpstreamMetric(upstreamName)
+	upstreamMetric.queryTotal.Add(1)
 
 	// Select best dial arguments (outbound, dialer, l4proto, ipversion, etc.)
 	rt := c.runtime()
