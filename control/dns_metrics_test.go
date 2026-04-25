@@ -6,6 +6,7 @@
 package control
 
 import (
+	"context"
 	"math"
 	"net"
 	"testing"
@@ -58,8 +59,10 @@ func TestDnsLatencyHistogramSnapshotMonotonic(t *testing.T) {
 
 func TestDnsControllerRejectCounter(t *testing.T) {
 	c := &DnsController{
-		log:                logrus.New(),
-		dnsResponseLatency: newDnsLatencyHistogram(),
+		log: logrus.New(),
+		dnsControllerStore: &dnsControllerStore{
+			dnsResponseLatency: newDnsLatencyHistogram(),
+		},
 	}
 	writer := &noopDNSResponseWriter{}
 
@@ -82,7 +85,7 @@ func TestDnsControllerRejectCounter(t *testing.T) {
 }
 
 func TestDnsControllerUpstreamSnapshot(t *testing.T) {
-	c := &DnsController{dnsResponseLatency: newDnsLatencyHistogram()}
+	c := &DnsController{dnsControllerStore: &dnsControllerStore{dnsResponseLatency: newDnsLatencyHistogram()}}
 	metric := c.getOrCreateDnsUpstreamMetric("udp://1.1.1.1:53")
 	metric.queryTotal.Add(2)
 	metric.errTotal.Add(1)
@@ -111,13 +114,15 @@ func TestDnsControllerUpstreamSnapshot(t *testing.T) {
 
 func TestDnsControllerHandleWithResponseWriterCountsQuery(t *testing.T) {
 	c := &DnsController{
-		log:                logrus.New(),
-		dnsResponseLatency: newDnsLatencyHistogram(),
+		log: logrus.New(),
+		dnsControllerStore: &dnsControllerStore{
+			dnsResponseLatency: newDnsLatencyHistogram(),
+		},
 	}
 	msg := new(dnsmessage.Msg)
 	msg.SetQuestion("query.example.", dnsmessage.TypeA)
 
-	if err := c.HandleWithResponseWriter_(msg, nil, nil); err == nil {
+	if err := c.HandleWithResponseWriter_(context.Background(), msg, nil, nil); err == nil {
 		t.Fatal("expected error when routing is nil")
 	}
 
@@ -132,7 +137,7 @@ func TestDnsControllerHandleWithResponseWriterCountsQuery(t *testing.T) {
 }
 
 func TestDnsControllerConcurrencyInfo(t *testing.T) {
-	c := &DnsController{}
+	c := &DnsController{dnsControllerStore: &dnsControllerStore{}}
 	c.dnsConcurrencyInFlight.Add(2)
 
 	if inUse := c.ConcurrencyInUse(); inUse != 2 {
