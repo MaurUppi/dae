@@ -308,8 +308,13 @@ func (c *ControlPlane) RouteDialTcpContext(ctx context.Context, p *RouteDialPara
 		Mark:        p.Mark,
 		Network:     "tcp",
 	}
-	conn, _, err = c.routeDial(ctx, dialParam)
-	return conn, err
+	var res *proxyDialResult
+	conn, res, err = c.routeDial(ctx, dialParam)
+	if err != nil {
+		return conn, err
+	}
+	c.AddTcpConnectionTotal(res.OrigNetworkTypeObj.StringWithoutDns(), res.Outbound.Name)
+	return conn, nil
 }
 
 type WriteCloser interface {
