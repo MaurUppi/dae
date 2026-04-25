@@ -687,6 +687,14 @@ func (r *Runner) Run() (err error) {
 
 			reloadManager.refreshPprofServer(log, &pprofServer, newConf.Global.PprofPort)
 
+			if endpointConfigChanged(endpointCfg, newEndpointCfg) {
+				if endpointServer != nil {
+					_ = endpointServer.Shutdown(context.Background())
+				}
+				endpointCfg = newEndpointCfg
+				startEndpointServer(endpointCfg)
+			}
+
 			notifyRunStateChange(runStateChanges)
 
 		}
@@ -862,13 +870,6 @@ loop:
 				reloadManager.finishReloadSuccess()
 				if dnsHandoffActive && log.IsLevelEnabled(logrus.DebugLevel) {
 					log.Debugln("[Reload] Shared DNS controller handoff remains available while old generation drains")
-				}
-				if endpointConfigChanged(endpointCfg, newEndpointCfg) {
-					if endpointServer != nil {
-						_ = endpointServer.Shutdown(context.Background())
-					}
-					endpointCfg = newEndpointCfg
-					startEndpointServer(endpointCfg)
 				}
 			} else if listener == nil {
 				// Listening error.

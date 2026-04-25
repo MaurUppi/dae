@@ -121,7 +121,9 @@ apply_overlay() {
     local rel="${src#$overlay_abs/}"
     local dst="$wt/$rel"
     mkdir -p "$(dirname "$dst")"
-    cp "$src" "$dst"
+    # Strip "//go:build ignore" tag added to prevent go test ./... from picking
+    # up the overlay file in its source directory where package types are absent.
+    grep -v '^//go:build ignore$' "$src" > "$dst"
   done < <(find "$overlay_abs" -type f | sort)
 }
 
