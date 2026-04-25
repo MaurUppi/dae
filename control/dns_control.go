@@ -2487,7 +2487,7 @@ func (c *DnsController) handleWithResponseWriter_(
 				c.log.Debugf("UDP(DNS) Cache: %v %v", strings.ToLower(q.Name), QtypeToString(q.Qtype))
 			}
 		}
-		return true, nil
+		return nil
 	}
 	if c.log.IsLevelEnabled(logrus.TraceLevel) {
 		upstreamName := upstreamIndex.String()
@@ -2503,7 +2503,7 @@ func (c *DnsController) handleWithResponseWriter_(
 	// Re-pack DNS packet.
 	data, err := dnsMessage.Pack()
 	if err != nil {
-		return false, fmt.Errorf("pack DNS packet: %w", err)
+		return fmt.Errorf("pack DNS packet: %w", err)
 	}
 	return c.dialSend(ctx, 0, req, data, dnsMessage.Id, upstream, needResp, responseWriter, responseCacheKey, baseCacheKey)
 }
