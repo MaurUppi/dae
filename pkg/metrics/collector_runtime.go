@@ -6,7 +6,6 @@
 package metrics
 
 import (
-	"github.com/daeuniverse/dae/control"
 	"github.com/prometheus/client_golang/prometheus"
 )
 
@@ -81,7 +80,7 @@ func (c *RuntimeCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 
-	snapshot := control.SnapshotRuntimeStats(cp.ActiveTCPConnections(), control.DefaultUdpEndpointPool.Count(), 0, 0)
+	snapshot := cp.SnapshotRuntimeStats(0, 0)
 	ch <- prometheus.MustNewConstMetric(c.uploadBytesTotal, prometheus.CounterValue, float64(snapshot.UploadTotal))
 	ch <- prometheus.MustNewConstMetric(c.downloadBytesTotal, prometheus.CounterValue, float64(snapshot.DownloadTotal))
 	ch <- prometheus.MustNewConstMetric(c.uploadRateBytesPerSecond, prometheus.GaugeValue, float64(snapshot.UploadRate))
