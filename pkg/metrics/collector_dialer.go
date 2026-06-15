@@ -15,14 +15,14 @@ import (
 // component/outbound/dialer (IdxDnsTcp4=0 … IdxUdp6=7) so that
 // AliveDialerSets()[i] and dialerMetricNetworkTypes[i] stay in sync.
 var dialerMetricNetworkTypes = [8]dialer.NetworkType{
-	{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4, IsDns: true},                                                       // [0] IdxDnsTcp4
-	{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_6, IsDns: true},                                                       // [1] IdxDnsTcp6
-	{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_4, IsDns: true, UdpHealthDomain: dialer.UdpHealthDomainDns},            // [2] IdxDnsUdp4
-	{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_6, IsDns: true, UdpHealthDomain: dialer.UdpHealthDomainDns},            // [3] IdxDnsUdp6
-	{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4, IsDns: false},                                                      // [4] IdxTcp4
-	{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_6, IsDns: false},                                                      // [5] IdxTcp6
-	{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_4, IsDns: false},                                                      // [6] IdxUdp4
-	{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_6, IsDns: false},                                                      // [7] IdxUdp6
+	{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4, IsDns: true},                                             // [0] IdxDnsTcp4
+	{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_6, IsDns: true},                                             // [1] IdxDnsTcp6
+	{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_4, IsDns: true, UdpHealthDomain: dialer.UdpHealthDomainDns}, // [2] IdxDnsUdp4
+	{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_6, IsDns: true, UdpHealthDomain: dialer.UdpHealthDomainDns}, // [3] IdxDnsUdp6
+	{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_4, IsDns: false},                                            // [4] IdxTcp4
+	{L4Proto: consts.L4ProtoStr_TCP, IpVersion: consts.IpVersionStr_6, IsDns: false},                                            // [5] IdxTcp6
+	{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_4, IsDns: false},                                            // [6] IdxUdp4
+	{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_6, IsDns: false},                                            // [7] IdxUdp6
 }
 
 type DialerCollector struct {
