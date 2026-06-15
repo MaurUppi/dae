@@ -847,13 +847,20 @@ func (d *Dialer) MustGetLatencies10(typ *NetworkType) *LatenciesN {
 	return d.mustGetCollection(typ).Latencies10
 }
 
-func (d *Dialer) GetCollectionState(typ *NetworkType) (alive bool, lastLatency, avg10, movingAvg time.Duration) {
+func (d *Dialer) GetCollectionState(typ *NetworkType) (alive bool, lastLatency, avg10, movingAvg time.Duration, hasLastLatency bool) {
 	d.collectionFineMu.Lock()
 	col := d.mustGetCollection(typ)
 	alive = col.Alive.Load()
 	movingAvg = col.MovingAverage
+	lastProbe := col.LastProbe
 	d.collectionFineMu.Unlock()
-	lastLatency, _ = col.Latencies10.LastLatency()
+	// Use LastProbe.Latency rather than Latencies10.LastLatency() so that
+	// timeout-penalty values (10 s injected on failure) are never surfaced
+	// as a real "last latency" reading.
+	if lastProbe.HasLatency {
+		lastLatency = lastProbe.Latency
+		hasLastLatency = true
+	}
 	avg10, _ = col.Latencies10.AvgLatency()
 	return
 }
