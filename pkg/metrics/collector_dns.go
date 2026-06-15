@@ -137,7 +137,7 @@ func (c *DnsCollector) Collect(ch chan<- prometheus.Metric) {
 	if cp == nil {
 		return
 	}
-	dc := cp.GetDnsController()
+	dc := cp.ActiveDnsController()
 	if dc == nil {
 		return
 	}
