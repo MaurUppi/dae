@@ -3,6 +3,7 @@
 package dns
 
 import (
+	"context"
 	"reflect"
 	"testing"
 	"unsafe"
@@ -69,7 +70,7 @@ func BenchmarkUpstreamResolver_GetUpstream_Serial(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		u, err := r.GetUpstream()
+		u, err := r.GetUpstream(context.Background())
 		if err != nil {
 			b.Fatalf("GetUpstream failed: %v", err)
 		}
@@ -83,7 +84,7 @@ func BenchmarkUpstreamResolver_GetUpstream_Parallel(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			u, err := r.GetUpstream()
+			u, err := r.GetUpstream(context.Background())
 			if err != nil {
 				b.Fatalf("GetUpstream failed: %v", err)
 			}
