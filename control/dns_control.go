@@ -2784,8 +2784,13 @@ func (c *DnsController) dialSend(
 	// Dial and send.
 	var respMsg *dnsmessage.Msg
 	var usedDialArg *dialArgument
+	upstreamMetric.inFlight.Add(1)
+	forwardStart := time.Now()
 	respMsg, usedDialArg, err = c.forwardWithFallback(ctx, req, upstream, dialArg, data)
+	upstreamMetric.inFlight.Add(-1)
+	upstreamMetric.latency.Observe(time.Since(forwardStart).Seconds())
 	if err != nil {
+		upstreamMetric.errTotal.Add(1)
 		return err
 	}
 
