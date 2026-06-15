@@ -482,7 +482,6 @@ func (r *Runner) Run() (err error) {
 				continue
 			}
 
-
 			// New control plane.
 			obj := c.PeekBpf()
 			if !stagedHotHandoff {

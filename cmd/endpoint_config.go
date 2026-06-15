@@ -49,7 +49,7 @@ func validateEndpointTLSFiles(cfg metricshttp.EndpointConfig) error {
 	if err != nil {
 		return fmt.Errorf("cannot open endpoint_tls_certificate '%s': %w", cfg.TlsCertificate, err)
 	}
-	defer certFile.Close()
+	defer func() { _ = certFile.Close() }()
 	certFi, err := certFile.Stat()
 	if err != nil {
 		return fmt.Errorf("cannot stat endpoint_tls_certificate '%s': %w", cfg.TlsCertificate, err)
@@ -62,7 +62,7 @@ func validateEndpointTLSFiles(cfg metricshttp.EndpointConfig) error {
 	if err != nil {
 		return fmt.Errorf("cannot open endpoint_tls_key '%s': %w", cfg.TlsKey, err)
 	}
-	defer keyFile.Close()
+	defer func() { _ = keyFile.Close() }()
 	keyFi, err := keyFile.Stat()
 	if err != nil {
 		return fmt.Errorf("cannot stat endpoint_tls_key '%s': %w", cfg.TlsKey, err)
