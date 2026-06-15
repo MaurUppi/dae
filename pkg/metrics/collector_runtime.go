@@ -50,13 +50,13 @@ func NewRuntimeCollector(state *State) *RuntimeCollector {
 		nodeLatencySeconds: prometheus.NewDesc(
 			"dae_node_latency_seconds",
 			"Best known per-node latency snapshot exported from runtime latency probing",
-			[]string{"link"},
+			[]string{"group", "name", "link"},
 			nil,
 		),
 		nodeAlive: prometheus.NewDesc(
 			"dae_node_alive",
 			"Whether the node is currently considered alive by runtime latency probing",
-			[]string{"link"},
+			[]string{"group", "name", "link"},
 			nil,
 		),
 	}
@@ -94,9 +94,9 @@ func (c *RuntimeCollector) Collect(ch chan<- prometheus.Metric) {
 		if node.Alive {
 			alive = 1
 		}
-		ch <- prometheus.MustNewConstMetric(c.nodeAlive, prometheus.GaugeValue, alive, node.Link)
+		ch <- prometheus.MustNewConstMetric(c.nodeAlive, prometheus.GaugeValue, alive, node.Group, node.Name, node.Link)
 		if node.LatencyMs != nil {
-			ch <- prometheus.MustNewConstMetric(c.nodeLatencySeconds, prometheus.GaugeValue, float64(*node.LatencyMs)/1000.0, node.Link)
+			ch <- prometheus.MustNewConstMetric(c.nodeLatencySeconds, prometheus.GaugeValue, float64(*node.LatencyMs)/1000.0, node.Group, node.Name, node.Link)
 		}
 	}
 }
