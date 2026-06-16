@@ -1,6 +1,6 @@
 /*
  * SPDX-License-Identifier: AGPL-3.0-only
- * Copyright (c) 2022-2025, daeuniverse Organization <dae@v2raya.org>
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
  */
 
 package dialer
@@ -466,6 +466,63 @@ func getActiveDialerCount() int {
 	return poolActiveCount
 }
 
+// shouldSkipTcp6Probes returns true when tcp_check_url explicitly lists only IPv4
+// addresses (no explicit IPv6 entries).
+// This avoids unnecessary IPv6 TCP probes when the user's network doesn't support IPv6.
+// Returns false (keep IPv6 probes) when:
+//   - Explicit IPv6 addresses are found in config
+//   - No explicit IPs are given (DNS resolution might return IPv6)
+func shouldSkipTcp6Probes(raw []string) bool {
+	hasIpv6 := false
+	hasExplicitIpv4 := false
+
+	for i := 1; i < len(raw); i++ {
+		addr, err := netip.ParseAddr(raw[i])
+		if err != nil {
+			continue
+		}
+		if addr.Is6() {
+			hasIpv6 = true
+		} else {
+			hasExplicitIpv4 = true
+		}
+	}
+
+	if hasIpv6 {
+		return false
+	}
+	return hasExplicitIpv4
+}
+
+// shouldSkipUdp6Probes returns true when udp_check_dns explicitly lists only IPv4
+// addresses (no explicit IPv6 entries).
+func shouldSkipUdp6Probes(raw []string) bool {
+	hasIpv6 := false
+	hasExplicitIpv4 := false
+
+	for i := 1; i < len(raw); i++ {
+		addr, err := netip.ParseAddr(raw[i])
+		if err != nil {
+			continue
+		}
+		if addr.Is6() {
+			hasIpv6 = true
+		} else {
+			hasExplicitIpv4 = true
+		}
+	}
+
+	if hasIpv6 {
+		return false
+	}
+	return hasExplicitIpv4
+}
+
+// hasUdpDnsConfig returns true if udp_check_dns is configured.
+func hasUdpDnsConfig(raw []string) bool {
+	return len(raw) > 0
+}
+
 func (d *Dialer) aliveBackground() {
 	cycle := d.CheckInterval
 	var tcpSomark uint32
@@ -565,7 +622,35 @@ func (d *Dialer) aliveBackground() {
 		},
 		CheckFunc: makeDnsCheckFunc(func(o *CheckDnsOption) netip.Addr { return o.Ip6 }, &udpNetwork),
 	}
-	var CheckOpts = []*CheckOption{tcp4CheckOpt, tcp6CheckOpt, udp4CheckDnsOpt, udp6CheckDnsOpt}
+	// Build CheckOpts dynamically based on configuration:
+	//   - Skip IPv6 TCP probes when tcp_check_url only has explicit IPv4 addresses
+	//   - Skip IPv6 UDP DNS probes when udp_check_dns only has explicit IPv4 addresses
+	//   - Skip all UDP DNS probes when udp_check_dns is not configured
+	skipTcp6 := shouldSkipTcp6Probes(d.TcpCheckOptionRaw.Raw)
+	skipUdp6 := shouldSkipUdp6Probes(d.CheckDnsOptionRaw.Raw)
+	useUdpDns := hasUdpDnsConfig(d.CheckDnsOptionRaw.Raw)
+
+	var CheckOpts []*CheckOption
+	CheckOpts = append(CheckOpts, tcp4CheckOpt)
+	if !skipTcp6 {
+		CheckOpts = append(CheckOpts, tcp6CheckOpt)
+	}
+	if useUdpDns {
+		CheckOpts = append(CheckOpts, udp4CheckDnsOpt)
+		if !skipUdp6 {
+			CheckOpts = append(CheckOpts, udp6CheckDnsOpt)
+		}
+	}
+
+	if d.Log.IsLevelEnabled(logrus.DebugLevel) {
+		d.Log.WithFields(logrus.Fields{
+			"dialer":   d.property.Name,
+			"tcp4":     true,
+			"tcp6":     !skipTcp6,
+			"udp4_dns": useUdpDns,
+			"udp6_dns": useUdpDns && !skipUdp6,
+		}).Debugln("Connectivity check probes configured")
+	}
 
 	var unusedOnce bool
 	checkUnused := func() bool {
@@ -685,7 +770,9 @@ func (d *Dialer) aliveBackground() {
 			// WITHOUT any successes in this cycle. This allows partially-working dual-stack
 			// nodes (e.g. V4 OK, V6 broken) to eventually wash white their penalty.
 			d.NotifyPeriodicCheckResult(consts.L4ProtoStr_TCP, cycleRes.tcpSuccess, cycleRes.tcpFailure && !cycleRes.tcpSuccess)
-			d.NotifyPeriodicCheckResultForType(udp4CheckDnsOpt.networkType, cycleRes.udpSuccess, cycleRes.udpFailure && !cycleRes.udpSuccess)
+			if useUdpDns {
+				d.NotifyPeriodicCheckResultForType(udp4CheckDnsOpt.networkType, cycleRes.udpSuccess, cycleRes.udpFailure && !cycleRes.udpSuccess)
+			}
 		}
 
 		// Targeted checks don't disturb the periodic timer — only full checks do.
@@ -940,9 +1027,6 @@ func (d *Dialer) markUnavailableInternal(typ *NetworkType, force bool, isTraffic
 		}
 		return update
 	}
-	collection.Latencies10.AppendLatency(Timeout)
-	collection.MovingAverage = (collection.MovingAverage + Timeout) / 2
-
 	// UDP/TCP robustness: only mark unavailable after consecutive failures.
 	// This protects against transient network interference.
 	threshold := 1
