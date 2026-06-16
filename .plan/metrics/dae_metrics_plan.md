@@ -146,11 +146,12 @@ cmd/run.go
 pkg/metrics/
   |-- state.go              -- State: thread-safe ControlPlane ref holder
   |-- registry.go           -- NewRegistry(), NewHTTPHandler()
-  |-- server.go             -- NewEndpointServer() with auth + TLS support
-  |-- auth.go               -- BasicAuth middleware
   |-- collector_dialer.go   -- Dialer health + health check stats
   |-- collector_dns.go      -- DNS cache, concurrency, forwarder stats
   |-- collector_conn.go     -- Connection pools + connection rate counters
+pkg/metricshttp/
+  |-- server.go             -- NewEndpointServer() with auth + TLS support
+  |-- auth.go               -- BasicAuth middleware
 ```
 
 Dependency direction: `pkg/metrics/` → `control/`, `component/outbound/` (infrastructure → domain).
@@ -187,15 +188,10 @@ func (d *Dialer) GetCollectionState(typ *NetworkType) (alive bool, lastLatency, 
 
 | Metric | Type | Labels | Source |
 |--------|------|--------|--------|
-| `dae_dns_cache_entries` | Gauge | — | `DnsController.CacheSize()` (new; reads `len(dnsCache)` under `dnsCacheMu`) |
-| `dae_dns_concurrency_in_use` | Gauge | — | `cap(concurrencyLimiter) - len(concurrencyLimiter)` |
-| `dae_dns_concurrency_limit` | Gauge | — | Removed until upstream has a real limiter data source |
-| `dae_dns_forwarder_cache_entries` | Gauge | — | `dnsForwarderCache.Range()` count |
-| `dae_dns_forwarder_in_flight` | Gauge | upstream | `cachedDnsForwarder.inFlight.Load()` per forwarder |
-
-**`concurrencyLimiter`** (PR#936): A buffered channel used as a semaphore. `cap - len` gives current in-use slots. When capacity is 0, the limiter is disabled.
-
-**`cachedDnsForwarder`** (PR#936): Wraps `DnsForwarder` with `inFlight atomic.Int32` and `lastUsedNano atomic.Int64`. Stored in `dnsForwarderCache sync.Map`. The `inFlight` counter is incremented/decremented around each DNS forwarding operation via `beginUse()`/`endUse()`.
+| `dae_dns_cache_entries` | Gauge | — | `DnsController.CacheSize()` (reads `dnsCache` sync.Map) |
+| `dae_dns_concurrency_in_use` | Gauge | — | `dnsConcurrencyInFlight` atomic around `HandleWithResponseWriter_` |
+| `dae_dns_forwarder_cache_entries` | Gauge | — | `ForwarderCacheInfo()` ranges `dnsForwarderCache` |
+| `dae_dns_forwarder_in_flight` | Gauge | upstream | `upstreamMetric.inFlight.Load()` per upstream via `dnsUpstreamMetrics` sync.Map |
 
 ### `pkg/metrics/collector_conn.go` (Phase 1 portion)
 
@@ -234,8 +230,7 @@ Add counters to `DnsController` struct:
 |--------|------|--------|----------------------|
 | `dae_dns_query_total` | Counter | — | `Handle_()` entry |
 | `dae_dns_cache_hit_total` | Counter | — | `LookupDnsRespCache_()` returns fresh hit |
-| `dae_dns_cache_lazy_hit_total` | Counter | — | Reserved zero-stub until stale-while-revalidate exists |
-| `dae_dns_cache_miss_total` | Counter | — | Removed; dashboard derives miss rate from `sum(rate(dae_dns_upstream_query_total[…]))` |
+| `dae_dns_cache_lazy_hit_total` | Counter | — | `needRefresh` path (stale-while-revalidate, real wiring in v3) |
 | `dae_dns_upstream_query_total` | Counter | upstream | `dialSend()` entry |
 | `dae_dns_upstream_err_total` | Counter | upstream | `forwardWithDialArg()` error path |
 | `dae_dns_rejected_total` | Counter | — | Reject response path |
@@ -527,7 +522,7 @@ git worktree add /Users/ouzy/Documents/DevProjects/dae-metrics-phase1 -b feat/me
 | `dae_dns_forwarder_in_flight` | Gauge | upstream | 1 |
 | `dae_dns_query_total` | Counter | — | 2 |
 | `dae_dns_cache_hit_total` | Counter | — | 2 |
-| `dae_dns_cache_lazy_hit_total` | Counter | — | 2 (reserved zero-stub) |
+| `dae_dns_cache_lazy_hit_total` | Counter | — | 2 (real wiring, needRefresh path in v3) |
 | `dae_dns_upstream_query_total` | Counter | upstream | 2 |
 | `dae_dns_upstream_err_total` | Counter | upstream | 2 |
 | `dae_dns_rejected_total` | Counter | — | 2 |
@@ -594,4 +589,4 @@ The rebased branch intentionally no longer depends on the abandoned PR#936 DNS l
 | `dae_dns_concurrency_in_use` | Synthesized with an atomic in-flight count around `HandleWithResponseWriter_`. |
 | `dae_dns_forwarder_in_flight` | Synthesized per upstream on `dnsUpstreamMetric`. |
 | `dae_dns_cache_miss_total` | Removed; dashboard derives miss rate from `sum(rate(dae_dns_upstream_query_total[…]))`. |
-| `dae_dns_cache_lazy_hit_total` | Kept as a documented zero-stub for forward-compatible stale-while-revalidate dashboards. |
+| `dae_dns_cache_lazy_hit_total` | Real wiring in v3 via the `needRefresh` (stale-while-revalidate) path. |

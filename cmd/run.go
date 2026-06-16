@@ -342,7 +342,8 @@ func (r *Runner) Run() (err error) {
 	if conf.Global.PprofPort != 0 {
 		pprofAddr := fmt.Sprintf("localhost:%d", conf.Global.PprofPort)
 		pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
-		go func() { _ = pprofServer.ListenAndServe() }()	}
+		go func() { _ = pprofServer.ListenAndServe() }()
+	}
 
 	metricsState := metrics.NewState()
 	metricsState.SetControlPlane(c)
@@ -476,11 +477,10 @@ func (r *Runner) Run() (err error) {
 				log.WithFields(logrus.Fields{
 					"err": err,
 				}).Errorln("[Reload] Failed to reload")
-				sdnotify.Ready()
+				_ = sdnotify.Ready()
 				_ = os.WriteFile(SignalProgressFilePath, append([]byte{consts.ReloadError}, []byte("\n"+err.Error())...), 0644)
 				continue
 			}
-
 
 			// New control plane.
 			obj := c.PeekBpf()

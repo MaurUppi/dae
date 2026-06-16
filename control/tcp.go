@@ -249,6 +249,7 @@ func (c *ControlPlane) handleConn(ctx context.Context, lConn net.Conn) (err erro
 		return fmt.Errorf("failed to dial %v: %w", dst, err)
 	}
 	defer func() { _ = rConn.Close() }()
+	c.AddTcpConnectionTotal(res.OrigNetworkTypeObj.StringWithoutDns(), res.Outbound.Name)
 
 	offloaded := false
 	offloadReason := ""
