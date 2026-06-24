@@ -6,6 +6,8 @@
 package metrics
 
 import (
+	"time"
+
 	"github.com/daeuniverse/dae/common/consts"
 	"github.com/daeuniverse/dae/component/outbound/dialer"
 	"github.com/prometheus/client_golang/prometheus"
@@ -25,6 +27,10 @@ var dialerMetricNetworkTypes = [8]dialer.NetworkType{
 	{L4Proto: consts.L4ProtoStr_UDP, IpVersion: consts.IpVersionStr_6, IsDns: false},                                            // [7] IdxUdp6
 }
 
+func timeNowUnixNano() int64 {
+	return time.Now().UnixNano()
+}
+
 type DialerCollector struct {
 	state *State
 
@@ -35,6 +41,14 @@ type DialerCollector struct {
 	healthCheckTotal       *prometheus.Desc
 	healthCheckFailure     *prometheus.Desc
 	groupAliveDialers      *prometheus.Desc
+	checkActivated         *prometheus.Desc
+	goroutineGeneration    *prometheus.Desc
+	loopAdvancedAge        *prometheus.Desc
+	probeDoneAge           *prometheus.Desc
+	inflightProbes         *prometheus.Desc
+	lastProbeAttemptAge    *prometheus.Desc
+	lastProbeSuccessAge    *prometheus.Desc
+	aliveSetRefCount       *prometheus.Desc
 }
 
 func NewDialerCollector(state *State) *DialerCollector {
@@ -82,6 +96,54 @@ func NewDialerCollector(state *State) *DialerCollector {
 			[]string{"group", "network"},
 			nil,
 		),
+		checkActivated: prometheus.NewDesc(
+			"dae_healthcheck_check_activated",
+			"Whether the dialer's health-check goroutine is currently activated",
+			[]string{"group", "dialer"},
+			nil,
+		),
+		goroutineGeneration: prometheus.NewDesc(
+			"dae_healthcheck_goroutine_generation",
+			"Monotonic generation counter incremented when a dialer health-check goroutine starts",
+			[]string{"group", "dialer"},
+			nil,
+		),
+		loopAdvancedAge: prometheus.NewDesc(
+			"dae_healthcheck_loop_advanced_age_seconds",
+			"Seconds since the dialer health-check loop advanced past its blocking select; -1 means never observed",
+			[]string{"group", "dialer"},
+			nil,
+		),
+		probeDoneAge: prometheus.NewDesc(
+			"dae_healthcheck_probe_done_age_seconds",
+			"Seconds since the dialer health-check worker wait completed; -1 means never observed",
+			[]string{"group", "dialer"},
+			nil,
+		),
+		inflightProbes: prometheus.NewDesc(
+			"dae_healthcheck_inflight_probes",
+			"Number of health-check probes submitted to the worker pool but not yet completed",
+			[]string{"group", "dialer"},
+			nil,
+		),
+		lastProbeAttemptAge: prometheus.NewDesc(
+			"dae_healthcheck_last_probe_attempt_age_seconds",
+			"Seconds since the last health-check probe attempt for the collection; -1 means never observed",
+			[]string{"group", "dialer", "networktype"},
+			nil,
+		),
+		lastProbeSuccessAge: prometheus.NewDesc(
+			"dae_healthcheck_last_probe_success_age_seconds",
+			"Seconds since the last successful health-check probe for the collection; -1 means never observed",
+			[]string{"group", "dialer", "networktype"},
+			nil,
+		),
+		aliveSetRefCount: prometheus.NewDesc(
+			"dae_healthcheck_alive_set_refcount",
+			"Reference count of AliveDialerSet registrations for the dialer's collection",
+			[]string{"group", "dialer", "collection"},
+			nil,
+		),
 	}
 }
 
@@ -93,6 +155,14 @@ func (c *DialerCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.healthCheckTotal
 	ch <- c.healthCheckFailure
 	ch <- c.groupAliveDialers
+	ch <- c.checkActivated
+	ch <- c.goroutineGeneration
+	ch <- c.loopAdvancedAge
+	ch <- c.probeDoneAge
+	ch <- c.inflightProbes
+	ch <- c.lastProbeAttemptAge
+	ch <- c.lastProbeSuccessAge
+	ch <- c.aliveSetRefCount
 }
 
 func (c *DialerCollector) Collect(ch chan<- prometheus.Metric) {
@@ -115,6 +185,16 @@ func (c *DialerCollector) Collect(ch chan<- prometheus.Metric) {
 			if prop == nil {
 				continue
 			}
+			healthcheck := d.HealthcheckDiagnosticsSnapshot(timeNowUnixNano())
+			activated := 0.0
+			if healthcheck.CheckActivated {
+				activated = 1
+			}
+			ch <- prometheus.MustNewConstMetric(c.checkActivated, prometheus.GaugeValue, activated, group.Name, prop.Name)
+			ch <- prometheus.MustNewConstMetric(c.goroutineGeneration, prometheus.GaugeValue, float64(healthcheck.GoroutineGeneration), group.Name, prop.Name)
+			ch <- prometheus.MustNewConstMetric(c.loopAdvancedAge, prometheus.GaugeValue, healthcheck.LoopAdvancedAgeSeconds, group.Name, prop.Name)
+			ch <- prometheus.MustNewConstMetric(c.probeDoneAge, prometheus.GaugeValue, healthcheck.ProbeDoneAgeSeconds, group.Name, prop.Name)
+			ch <- prometheus.MustNewConstMetric(c.inflightProbes, prometheus.GaugeValue, float64(healthcheck.InflightProbes), group.Name, prop.Name)
 			for i := range dialerMetricNetworkTypes {
 				typ := dialerMetricNetworkTypes[i]
 				alive, lastLatency, avg10, movingAvg, hasLastLatency := d.GetCollectionState(&typ)
@@ -132,6 +212,9 @@ func (c *DialerCollector) Collect(ch chan<- prometheus.Metric) {
 				checkTotal, checkFailureTotal := d.GetCollectionCounters(&typ)
 				ch <- prometheus.MustNewConstMetric(c.healthCheckTotal, prometheus.CounterValue, float64(checkTotal), labels...)
 				ch <- prometheus.MustNewConstMetric(c.healthCheckFailure, prometheus.CounterValue, float64(checkFailureTotal), labels...)
+				ch <- prometheus.MustNewConstMetric(c.lastProbeAttemptAge, prometheus.GaugeValue, healthcheck.LastProbeAttemptAgeSeconds[i], group.Name, prop.Name, typ.String())
+				ch <- prometheus.MustNewConstMetric(c.lastProbeSuccessAge, prometheus.GaugeValue, healthcheck.LastProbeSuccessAgeSeconds[i], group.Name, prop.Name, typ.String())
+				ch <- prometheus.MustNewConstMetric(c.aliveSetRefCount, prometheus.GaugeValue, float64(healthcheck.AliveSetRefCount[i]), group.Name, prop.Name, typ.String())
 			}
 		}
 		for i, set := range group.AliveDialerSets() {

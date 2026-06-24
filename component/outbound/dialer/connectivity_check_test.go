@@ -357,6 +357,67 @@ func TestDialerReportAvailableTraffic_ResetsFailureCounter(t *testing.T) {
 	}
 }
 
+func TestDialerHealthcheckDiagnosticsSnapshotRecordsLifecycleAndRefcounts(t *testing.T) {
+	d := newTestDialer(t)
+	networkType := newTestNetworkType()
+	aliveSet := NewAliveDialerSet(
+		d.Log,
+		"test-group",
+		networkType,
+		0,
+		consts.DialerSelectionPolicy_Random,
+		[]*Dialer{d},
+		[]*Annotation{{}},
+		func(bool) {},
+		true,
+	)
+
+	d.noteHealthcheckStarted()
+	d.noteHealthcheckLoopAdvanced(100 * int64(time.Millisecond))
+	d.noteHealthcheckProbeDone(200 * int64(time.Millisecond))
+	d.noteHealthcheckProbeAttempt(networkType, 300*int64(time.Millisecond))
+	d.noteHealthcheckProbeStarted()
+	d.noteHealthcheckProbeFinished()
+	d.noteHealthcheckProbeSuccess(networkType, 400*int64(time.Millisecond))
+	d.RegisterAliveDialerSet(aliveSet)
+	t.Cleanup(func() {
+		d.UnregisterAliveDialerSet(aliveSet)
+	})
+
+	snapshot := d.HealthcheckDiagnosticsSnapshot(int64(time.Second))
+	if snapshot.GoroutineGeneration != 1 {
+		t.Fatalf("goroutine generation = %d, want 1", snapshot.GoroutineGeneration)
+	}
+	if !snapshot.CheckActivated {
+		t.Fatal("check activated flag should be true after start")
+	}
+	if snapshot.LoopAdvancedAgeSeconds != 0.9 {
+		t.Fatalf("loop advanced age = %v, want 0.9", snapshot.LoopAdvancedAgeSeconds)
+	}
+	if snapshot.ProbeDoneAgeSeconds != 0.8 {
+		t.Fatalf("probe done age = %v, want 0.8", snapshot.ProbeDoneAgeSeconds)
+	}
+	if snapshot.InflightProbes != 0 {
+		t.Fatalf("inflight probes = %d, want 0", snapshot.InflightProbes)
+	}
+	idx := networkType.Index()
+	if got := snapshot.LastProbeAttemptAgeSeconds[idx]; got != 0.7 {
+		t.Fatalf("attempt age[%d] = %v, want 0.7", idx, got)
+	}
+	if got := snapshot.LastProbeSuccessAgeSeconds[idx]; got != 0.6 {
+		t.Fatalf("success age[%d] = %v, want 0.6", idx, got)
+	}
+	if got := snapshot.AliveSetRefCount[idx]; got != 1 {
+		t.Fatalf("refcount[%d] = %d, want 1", idx, got)
+	}
+
+	d.noteHealthcheckExited()
+	snapshot = d.HealthcheckDiagnosticsSnapshot(int64(time.Second))
+	if snapshot.CheckActivated {
+		t.Fatal("check activated flag should be false after exit")
+	}
+}
+
 func TestNetworkTypeIndex_SplitsDnsAndDataUdpDomains(t *testing.T) {
 	dnsType := &NetworkType{
 		L4Proto:         consts.L4ProtoStr_UDP,

@@ -81,6 +81,14 @@ func TestDialerCollectorDescribeIncludesPhase2Descriptors(t *testing.T) {
 		"dae_health_check_total",
 		"dae_health_check_failure_total",
 		"dae_group_alive_dialers_total",
+		"dae_healthcheck_check_activated",
+		"dae_healthcheck_goroutine_generation",
+		"dae_healthcheck_loop_advanced_age_seconds",
+		"dae_healthcheck_probe_done_age_seconds",
+		"dae_healthcheck_inflight_probes",
+		"dae_healthcheck_last_probe_attempt_age_seconds",
+		"dae_healthcheck_last_probe_success_age_seconds",
+		"dae_healthcheck_alive_set_refcount",
 	})
 }
 

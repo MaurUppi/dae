@@ -382,7 +382,80 @@ func (d *Dialer) ActivateCheck() {
 		return
 	}
 	d.checkActivated = true
+	d.checkActivatedFlag.Store(true)
 	go d.aliveBackground()
+}
+
+type HealthcheckDiagnosticsSnapshot struct {
+	CheckActivated             bool
+	GoroutineGeneration        int64
+	LoopAdvancedAgeSeconds     float64
+	ProbeDoneAgeSeconds        float64
+	InflightProbes             int32
+	LastProbeAttemptAgeSeconds [8]float64
+	LastProbeSuccessAgeSeconds [8]float64
+	AliveSetRefCount           [8]int32
+}
+
+func healthcheckAgeSeconds(nowNs, observedNs int64) float64 {
+	if observedNs <= 0 || nowNs < observedNs {
+		return -1
+	}
+	return float64(nowNs-observedNs) / float64(time.Second)
+}
+
+func (d *Dialer) HealthcheckDiagnosticsSnapshot(nowNs int64) HealthcheckDiagnosticsSnapshot {
+	var snapshot HealthcheckDiagnosticsSnapshot
+	snapshot.CheckActivated = d.checkActivatedFlag.Load()
+	snapshot.GoroutineGeneration = d.healthcheckGoroutineGen.Load()
+	snapshot.LoopAdvancedAgeSeconds = healthcheckAgeSeconds(nowNs, d.loopAdvancedAtNs.Load())
+	snapshot.ProbeDoneAgeSeconds = healthcheckAgeSeconds(nowNs, d.probeDoneAtNs.Load())
+	snapshot.InflightProbes = d.inflightProbes.Load()
+	for i := range snapshot.LastProbeAttemptAgeSeconds {
+		snapshot.LastProbeAttemptAgeSeconds[i] = healthcheckAgeSeconds(nowNs, d.lastProbeAttemptNs[i].Load())
+		snapshot.LastProbeSuccessAgeSeconds[i] = healthcheckAgeSeconds(nowNs, d.lastProbeSuccessNs[i].Load())
+		snapshot.AliveSetRefCount[i] = d.aliveSetRefCount[i].Load()
+	}
+	return snapshot
+}
+
+func (d *Dialer) noteHealthcheckStarted() int64 {
+	d.checkActivatedFlag.Store(true)
+	return d.healthcheckGoroutineGen.Add(1)
+}
+
+func (d *Dialer) noteHealthcheckExited() {
+	d.checkActivatedFlag.Store(false)
+}
+
+func (d *Dialer) noteHealthcheckLoopAdvanced(nowNs int64) {
+	d.loopAdvancedAtNs.Store(nowNs)
+}
+
+func (d *Dialer) noteHealthcheckProbeDone(nowNs int64) {
+	d.probeDoneAtNs.Store(nowNs)
+}
+
+func (d *Dialer) noteHealthcheckProbeAttempt(typ *NetworkType, nowNs int64) {
+	if typ == nil {
+		return
+	}
+	d.lastProbeAttemptNs[typ.Index()].Store(nowNs)
+}
+
+func (d *Dialer) noteHealthcheckProbeSuccess(typ *NetworkType, nowNs int64) {
+	if typ == nil {
+		return
+	}
+	d.lastProbeSuccessNs[typ.Index()].Store(nowNs)
+}
+
+func (d *Dialer) noteHealthcheckProbeStarted() {
+	d.inflightProbes.Add(1)
+}
+
+func (d *Dialer) noteHealthcheckProbeFinished() {
+	d.inflightProbes.Add(-1)
 }
 
 // Global connectivity check worker pool
@@ -524,6 +597,8 @@ func hasUdpDnsConfig(raw []string) bool {
 }
 
 func (d *Dialer) aliveBackground() {
+	gen := d.noteHealthcheckStarted()
+	exitReason := "ctxDone"
 	cycle := d.CheckInterval
 	var tcpSomark uint32
 	var mptcp bool
@@ -651,6 +726,10 @@ func (d *Dialer) aliveBackground() {
 			"udp6_dns": useUdpDns && !skipUdp6,
 		}).Debugln("Connectivity check probes configured")
 	}
+	d.Log.WithFields(logrus.Fields{
+		"dialer":     d.Property().Name,
+		"generation": gen,
+	}).Infoln("connectivity check goroutine started")
 
 	var unusedOnce bool
 	checkUnused := func() bool {
@@ -701,6 +780,25 @@ func (d *Dialer) aliveBackground() {
 	d.ticker = time.NewTimer(initialDelay)
 	d.tickerMu.Unlock()
 	defer func() {
+		if r := recover(); r != nil {
+			exitReason = "panic"
+			d.noteHealthcheckExited()
+			d.tickerMu.Lock()
+			if d.ticker != nil {
+				d.ticker.Stop()
+				d.ticker = nil
+			}
+			d.checkActivated = false
+			d.tickerMu.Unlock()
+			releaseConnectivityCheckDialer()
+			d.Log.WithFields(logrus.Fields{
+				"dialer":     d.Property().Name,
+				"generation": gen,
+				"reason":     exitReason,
+				"panic":      fmt.Sprint(r),
+			}).Infoln("connectivity check goroutine exited")
+			panic(r)
+		}
 		d.tickerMu.Lock()
 		if d.ticker != nil {
 			d.ticker.Stop()
@@ -708,7 +806,13 @@ func (d *Dialer) aliveBackground() {
 		}
 		d.checkActivated = false
 		d.tickerMu.Unlock()
+		d.noteHealthcheckExited()
 		releaseConnectivityCheckDialer()
+		d.Log.WithFields(logrus.Fields{
+			"dialer":     d.Property().Name,
+			"generation": gen,
+			"reason":     exitReason,
+		}).Infoln("connectivity check goroutine exited")
 		d.Log.WithField("dialer", d.Property().Name).
 			WithField("p", unsafe.Pointer(d)).
 			Traceln("cleaned up connectivity check goroutine")
@@ -721,6 +825,7 @@ func (d *Dialer) aliveBackground() {
 	for {
 		// Check if the dialer is still useful. If not, exit the goroutine.
 		if checkUnused() {
+			exitReason = "unused"
 			return
 		}
 
@@ -731,6 +836,7 @@ func (d *Dialer) aliveBackground() {
 		var cycleRes *cycleResult
 		select {
 		case <-d.ctx.Done():
+			exitReason = "ctxDone"
 			return
 		case <-d.ticker.C:
 		case <-d.checkCh:
@@ -739,6 +845,7 @@ func (d *Dialer) aliveBackground() {
 		case <-d.checkTcpCh:
 			checkFamily = consts.L4ProtoStr_TCP
 		}
+		d.noteHealthcheckLoopAdvanced(time.Now().UnixNano())
 
 		d.TcpCheckOptionRaw.Reset()
 		d.CheckDnsOptionRaw.Reset()
@@ -763,8 +870,10 @@ func (d *Dialer) aliveBackground() {
 		select {
 		case <-waitDone:
 		case <-d.ctx.Done():
+			exitReason = "ctxDone"
 			return
 		}
+		d.noteHealthcheckProbeDone(time.Now().UnixNano())
 		if checkFamily == "" {
 			// Stability-based wash white: only reset stability if a protocol family had failures
 			// WITHOUT any successes in this cycle. This allows partially-working dual-stack
@@ -832,8 +941,13 @@ func (d *Dialer) submitCheckTasks(workerPool *ants.Pool, wg *sync.WaitGroup, opt
 
 		wg.Add(1)
 		checkOpt := opt
+		d.noteHealthcheckProbeAttempt(checkOpt.networkType, time.Now().UnixNano())
+		d.noteHealthcheckProbeStarted()
 		err := workerPool.Submit(func() {
-			defer wg.Done()
+			defer func() {
+				d.noteHealthcheckProbeFinished()
+				wg.Done()
+			}()
 			select {
 			case <-d.ctx.Done():
 				return
@@ -858,6 +972,7 @@ func (d *Dialer) submitCheckTasks(workerPool *ants.Pool, wg *sync.WaitGroup, opt
 			// Nonblocking pools report overload immediately. Health checks are
 			// periodic, so skip this probe instead of spawning an unbounded
 			// goroutine that can outlive the dialer lifecycle.
+			d.noteHealthcheckProbeFinished()
 			wg.Done()
 			if stderrors.Is(err, ants.ErrPoolClosed) || stderrors.Is(err, ants.ErrPoolOverload) {
 				continue
@@ -965,6 +1080,7 @@ func (d *Dialer) RegisterAliveDialerSet(a *AliveDialerSet) {
 	d.collectionFineMu.Lock()
 	d.mustGetCollection(a.CheckTyp).AliveDialerSetSet[a]++
 	d.collectionFineMu.Unlock()
+	d.aliveSetRefCount[a.CheckTyp.Index()].Add(1)
 }
 
 // UnregisterAliveDialerSet is thread-safe.
@@ -975,10 +1091,17 @@ func (d *Dialer) UnregisterAliveDialerSet(a *AliveDialerSet) {
 	d.collectionFineMu.Lock()
 	defer d.collectionFineMu.Unlock()
 	setSet := d.mustGetCollection(a.CheckTyp).AliveDialerSetSet
-	setSet[a]--
-	if setSet[a] <= 0 {
-		delete(setSet, a)
+	count, ok := setSet[a]
+	if !ok || count <= 0 {
+		return
 	}
+	if count <= 1 {
+		delete(setSet, a)
+		d.aliveSetRefCount[a.CheckTyp.Index()].Add(-1)
+		return
+	}
+	setSet[a] = count - 1
+	d.aliveSetRefCount[a.CheckTyp.Index()].Add(-1)
 }
 
 func (d *Dialer) logUnavailable(
@@ -1093,6 +1216,7 @@ func (d *Dialer) markUnavailableInternal(typ *NetworkType, force bool, isTraffic
 }
 
 func (d *Dialer) markAvailable(typ *NetworkType, latency time.Duration) (collectionUpdate, time.Duration) {
+	d.noteHealthcheckProbeSuccess(typ, time.Now().UnixNano())
 	d.collectionFineMu.Lock()
 	idx := typ.Index()
 	collection := d.collections[idx]

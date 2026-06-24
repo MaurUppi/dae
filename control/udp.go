@@ -142,6 +142,27 @@ func shouldRejectNewUdpDialSelection(res *proxyDialResult) bool {
 	return !res.Dialer.MustGetAlive(networkType)
 }
 
+func udpDialerName(d *dialer.Dialer) string {
+	if d == nil || d.Property() == nil {
+		return ""
+	}
+	return d.Property().Name
+}
+
+func udpLastProbeAge(d *dialer.Dialer, typ *dialer.NetworkType, now time.Time) (time.Duration, bool) {
+	if d == nil || typ == nil {
+		return 0, true
+	}
+	snapshot := d.SnapshotLastProbe(typ)
+	if snapshot.CheckedAt.IsZero() {
+		return 0, true
+	}
+	if now.Before(snapshot.CheckedAt) {
+		return 0, false
+	}
+	return now.Sub(snapshot.CheckedAt), false
+}
+
 func (c *ControlPlane) checkUdpEndpointHealth(ue *UdpEndpoint, ueKey UdpEndpointKey, isFastPath bool) bool {
 	if ue == nil || ue.Dialer == nil {
 		return false
@@ -880,6 +901,8 @@ afterSniffing:
 	payloads = append(payloads, data)
 	packetIndex := 0
 	retry := 0
+	var attemptedDialers []string
+	var lastWriteErr error
 	var isNew bool
 	networkType := &dialer.NetworkType{
 		L4Proto:         consts.L4ProtoStr_UDP,
@@ -891,12 +914,19 @@ afterSniffing:
 	dialTarget := realDst.String()
 getNew:
 	if retry > MaxRetry {
-		c.log.WithFields(logrus.Fields{
-			"src":     RefineSourceToShow(realSrc, realDst.Addr()),
-			"network": networkType.String(),
-			"dialer":  ue.Dialer.Property().Name,
-			"retry":   retry,
-		}).Warnln("Touch max retry limit.")
+		finalDialer := udpDialerName(ue.Dialer)
+		lastProbeAge, neverProbed := udpLastProbeAge(ue.Dialer, networkType, time.Now())
+		c.log.WithFields(udpRetryLimitLogFields(udpRetryLimitDiagnostic{
+			Source:                 realSrc,
+			Destination:            realDst.Addr(),
+			Network:                networkType.String(),
+			FinalDialer:            finalDialer,
+			Retry:                  retry,
+			LastWriteError:         lastWriteErr,
+			AttemptedDialers:       attemptedDialers,
+			LastProbeAge:           lastProbeAge,
+			LastProbeNeverObserved: neverProbed,
+		})).Warnln("Touch max retry limit.")
 		return fmt.Errorf("touch max retry limit")
 	}
 
@@ -984,7 +1014,6 @@ getNew:
 					}
 					return nil, ob.ErrNoAliveDialer
 				}
-
 				return &DialOption{
 					// Keep fixed-IP target even if chooseProxyDialer selected a domain target.
 					Target:        dialTarget,
@@ -1014,6 +1043,9 @@ getNew:
 	// exact endpoint network type before writing. This keeps the slow path aligned
 	// with the fast-path health checks and exact per-family invalidation.
 	if !isNew && !c.checkUdpEndpointHealth(ue, ueKey, false) {
+		if name := udpDialerName(ue.Dialer); name != "" {
+			attemptedDialers = append(attemptedDialers, name)
+		}
 		// Exclude the dead dialer to force selection of a different one on retry.
 		excludedDialer = ue.Dialer
 		retry++
@@ -1026,8 +1058,12 @@ getNew:
 	ue.TrackUdpConnStateTuplePair(realSrc, realDst)
 
 	for packetIndex < len(payloads) {
+		if name := udpDialerName(ue.Dialer); name != "" {
+			attemptedDialers = append(attemptedDialers, name)
+		}
 		_, err = ue.WriteTo(payloads[packetIndex], dialTarget)
 		if err != nil {
+			lastWriteErr = err
 			if c.log.IsLevelEnabled(logrus.DebugLevel) {
 				c.log.WithFields(logrus.Fields{
 					"to":      realDst.String(),

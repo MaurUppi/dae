@@ -137,6 +137,15 @@ type Dialer struct {
 	lastNotifyTcp atomic.Int64
 	lastPunish    [3]atomic.Int64
 
+	healthcheckGoroutineGen atomic.Int64
+	checkActivatedFlag      atomic.Bool
+	loopAdvancedAtNs        atomic.Int64
+	probeDoneAtNs           atomic.Int64
+	inflightProbes          atomic.Int32
+	lastProbeAttemptNs      [8]atomic.Int64
+	lastProbeSuccessNs      [8]atomic.Int64
+	aliveSetRefCount        [8]atomic.Int32
+
 	recoveryManagerMu sync.Mutex
 	recoveryManager   *dialerRecoveryManager
 }
