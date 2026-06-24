@@ -7,6 +7,7 @@ import argparse
 import json
 import pathlib
 import re
+import subprocess
 import sys
 
 
@@ -68,12 +69,44 @@ def parse_log_file(path: pathlib.Path):
                 yield record
 
 
+def parse_log_text(text: str):
+    for line in text.splitlines():
+        record = parse_log_line(line)
+        if record is not None:
+            yield record
+
+
+def read_dae_journal(since: str | None = None) -> str:
+    command = ["journalctl", "-u", "dae.service", "--no-pager", "-o", "cat"]
+    if since:
+        command.extend(["--since", since])
+    completed = subprocess.run(
+        command,
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    return completed.stdout
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("logfile", type=pathlib.Path)
+    parser.add_argument("since_arg", nargs="*", help='Journal start time, for example "2026-06-24 20:16:44"')
+    parser.add_argument("--since", help='Journal start time, for example "2026-06-24 20:16:44"')
+    parser.add_argument("--file", type=pathlib.Path, help="Read logs from a file instead of journalctl")
     args = parser.parse_args(argv)
 
-    for record in parse_log_file(args.logfile):
+    since_arg = " ".join(args.since_arg) if args.since_arg else None
+    if since_arg and args.since:
+        parser.error("provide either positional time or --since, not both")
+
+    if args.file is not None:
+        records = parse_log_file(args.file)
+    else:
+        records = parse_log_text(read_dae_journal(args.since or since_arg))
+
+    for record in records:
         print(json.dumps(record, sort_keys=True))
     return 0
 
