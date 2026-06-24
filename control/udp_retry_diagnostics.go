@@ -42,3 +42,13 @@ func udpRetryLimitLogFields(diag udpRetryLimitDiagnostic) logrus.Fields {
 	}
 	return fields
 }
+
+func udpAppendAttemptedDialer(attempted []string, name string) []string {
+	if name == "" {
+		return attempted
+	}
+	if len(attempted) > 0 && attempted[len(attempted)-1] == name {
+		return attempted
+	}
+	return append(attempted, name)
+}

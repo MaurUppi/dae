@@ -67,3 +67,22 @@ func TestUdpRetryLimitLogFieldsMarkNeverProbed(t *testing.T) {
 		t.Fatalf("last_probe_never_observed = %v, want true", fields["last_probe_never_observed"])
 	}
 }
+
+func TestUdpAppendAttemptedDialerDeduplicatesOnlyConsecutiveAttempts(t *testing.T) {
+	var attempted []string
+	attempted = udpAppendAttemptedDialer(attempted, "dead-a")
+	attempted = udpAppendAttemptedDialer(attempted, "dead-a")
+	attempted = udpAppendAttemptedDialer(attempted, "dead-b")
+	attempted = udpAppendAttemptedDialer(attempted, "dead-a")
+	attempted = udpAppendAttemptedDialer(attempted, "")
+
+	want := []string{"dead-a", "dead-b", "dead-a"}
+	if len(attempted) != len(want) {
+		t.Fatalf("attempted length = %d, want %d: %#v", len(attempted), len(want), attempted)
+	}
+	for i := range want {
+		if attempted[i] != want[i] {
+			t.Fatalf("attempted[%d] = %q, want %q; full=%#v", i, attempted[i], want[i], attempted)
+		}
+	}
+}

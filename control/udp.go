@@ -1043,9 +1043,7 @@ getNew:
 	// exact endpoint network type before writing. This keeps the slow path aligned
 	// with the fast-path health checks and exact per-family invalidation.
 	if !isNew && !c.checkUdpEndpointHealth(ue, ueKey, false) {
-		if name := udpDialerName(ue.Dialer); name != "" {
-			attemptedDialers = append(attemptedDialers, name)
-		}
+		attemptedDialers = udpAppendAttemptedDialer(attemptedDialers, udpDialerName(ue.Dialer))
 		// Exclude the dead dialer to force selection of a different one on retry.
 		excludedDialer = ue.Dialer
 		retry++
@@ -1058,9 +1056,7 @@ getNew:
 	ue.TrackUdpConnStateTuplePair(realSrc, realDst)
 
 	for packetIndex < len(payloads) {
-		if name := udpDialerName(ue.Dialer); name != "" {
-			attemptedDialers = append(attemptedDialers, name)
-		}
+		attemptedDialers = udpAppendAttemptedDialer(attemptedDialers, udpDialerName(ue.Dialer))
 		_, err = ue.WriteTo(payloads[packetIndex], dialTarget)
 		if err != nil {
 			lastWriteErr = err
