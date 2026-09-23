@@ -99,7 +99,7 @@ prepare_tree() {
     export GOWORK=off
     export GOFLAGS="${GOFLAGS:-} -buildvcs=false"
     export BPF_CLANG="${BPF_CLANG:-clang}"
-    export BPF_STRIP_FLAG="${BPF_STRIP_FLAG:---strip-debug}"
+    export BPF_STRIP_FLAG="${BPF_STRIP_FLAG:--no-strip}"
     export BPF_CFLAGS="${BPF_CFLAGS:--O2 -Wall -Werror -DMAX_MATCH_SET_LEN=1024}"
     export BPF_TARGET="${BPF_TARGET:-bpfel}"
     if [[ "$BENCH_PACKAGE" == "./control"* || "$BENCH_PACKAGE" == "control"* ]]; then

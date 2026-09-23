@@ -17,7 +17,7 @@ Key data structures verified on `eval/pr936-base` (`dae/main` + PR#936):
 | `DnsController.concurrencyLimiter` | `control/dns_control.go:86` | `chan struct{}` (capacity default 16384; 0 = no limit) |
 | `DnsController.dnsCache` | `control/dns_control.go` | `map[string]*DnsCache` + `dnsCacheMu sync.Mutex` |
 | `DnsController.dnsForwarderCache` | `control/dns_control.go:106` | `sync.Map` (key: `dnsForwarderKey`, value: `*cachedDnsForwarder`) |
-| `cachedDnsForwarder.inFlight` | `control/dns_control.go:782` | `atomic.Int32` (per-forwarder in-flight counter) |
+| `cachedDnsForwarder.inFlight` | `control/dns_controller_forwarder.go:51` | `atomic.Int32` (per-forwarder in-flight counter) |
 | `ControlPlane.inConnections` | `control/control_plane.go:57` | `sync.Map` |
 | `UdpEndpointPool.pool` | `control/udp_endpoint_pool.go:75` | `sync.Map` |
 | `UdpTaskPool` (queues) | `control/udp_task_pool.go:42` | struct with internal map |
@@ -363,7 +363,7 @@ func (c *ControlPlane) CountTcpConnections() int  // inConnections.Range() count
 ### `control/tcp.go` — Phase 2: increment counter in `handleConn()`
 ### `control/udp.go` — Phase 2: increment counter in `handlePkt()`
 
-### `control/dns_control.go` — Getters + Phase 2 DnsCounters
+### `control/dns_control.go` — `dnsControllerStore` counter fields; getters in `control/dns_metrics.go`
 ```go
 func (c *DnsController) CacheSize() int
 func (c *DnsController) ConcurrencyInfo() (current, limit int)    // cap/len of concurrencyLimiter
