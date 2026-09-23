@@ -70,7 +70,7 @@ func NewDnsCollector(state *State) *DnsCollector {
 		),
 		cacheLazyHitTotal: prometheus.NewDesc(
 			"dae_dns_cache_lazy_hit_total",
-			"Total number of stale DNS cache responses served while refreshing in background. Always 0 until stale-while-revalidate is implemented.",
+			"Total number of stale DNS cache responses served while a background refresh is triggered",
 			nil,
 			nil,
 		),

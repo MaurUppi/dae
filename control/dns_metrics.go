@@ -6,9 +6,12 @@
 package control
 
 import (
+	"fmt"
 	"math"
 	"sync/atomic"
 	"time"
+
+	dnsmessage "github.com/miekg/dns"
 )
 
 var dnsLatencyHistogramBounds = []float64{
@@ -217,4 +220,41 @@ func (c *DnsController) ForwarderCacheInfo() (count int) {
 		return true
 	})
 	return count
+}
+
+// dnsCacheDelivery records whether one DNS request was ultimately answered
+// from the response cache. noteDNSCacheServed is the only place that
+// increments the hit counters, so a request that passes more than one cache
+// lookup still counts once.
+type dnsCacheDelivery struct {
+	served bool
+	lazy   bool
+}
+
+func (c *DnsController) noteDNSCacheServed(delivery *dnsCacheDelivery, lazy bool) {
+	if c == nil || delivery == nil || delivery.served {
+		return
+	}
+	delivery.served = true
+	delivery.lazy = lazy
+	c.dnsCacheHitTotal.Add(1)
+	if lazy {
+		c.dnsCacheLazyHitTotal.Add(1)
+	}
+}
+
+// finishDNSUpstreamExchange records latency for one upstream exchange and
+// counts forward failures and question-echo mismatches as errors.
+func (c *DnsController) finishDNSUpstreamExchange(metric *dnsUpstreamMetric, upstreamName string, started time.Time, reqQuestion dnsmessage.Question, resp *dnsmessage.Msg, forwardErr error) error {
+	if metric != nil {
+		metric.latency.Observe(time.Since(started).Seconds())
+	}
+	exchangeErr := forwardErr
+	if exchangeErr == nil && reqQuestion.Name != "" && !questionEchoMatches(reqQuestion, resp) {
+		exchangeErr = fmt.Errorf("upstream %v reply does not echo the request question (possible spoofing or upstream cross-talk); dropped", upstreamName)
+	}
+	if exchangeErr != nil && metric != nil {
+		metric.errTotal.Add(1)
+	}
+	return exchangeErr
 }

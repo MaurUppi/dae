@@ -51,7 +51,7 @@ func NewConnCollector(state *State) *ConnCollector {
 		),
 		udpConnectionsTotal: prometheus.NewDesc(
 			"dae_udp_connections_total",
-			"Total number of new proxied UDP endpoint associations with successful first packet",
+			"Total number of UDP endpoints created (first datagram accepted)",
 			[]string{"protocol", "group"},
 			nil,
 		),
