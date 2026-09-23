@@ -8,7 +8,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"net/http"
 	"os"
 	"strings"
 
@@ -16,6 +15,7 @@ import (
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/daeuniverse/dae/pkg/logger"
+	"github.com/daeuniverse/dae/pkg/metrics"
 	"github.com/mohae/deepcopy"
 	"github.com/okzk/sdnotify"
 	"github.com/sirupsen/logrus"
@@ -38,12 +38,13 @@ type reloadWorker struct {
 	// Run's original local variables; the signal loop advances c, conf,
 	// currCancel, and listener after publishing a candidate generation, and
 	// this worker swaps log when a reload changes the log level.
-	log         *logrus.Logger
-	conf        *config.Config
-	c           *control.ControlPlane
-	currCancel  context.CancelFunc
-	listener    *control.Listener
-	pprofServer *http.Server
+	log          *logrus.Logger
+	conf         *config.Config
+	c            *control.ControlPlane
+	currCancel   context.CancelFunc
+	listener     *control.Listener
+	metricsState *metrics.State
+	mgmt         managementServers
 }
 
 // attachPreparedSessionManager attaches the process-owned session manager to a
@@ -111,6 +112,13 @@ func (w *reloadWorker) run() {
 				continue
 			}
 			w.log.Infof("Include config files: [%v]", strings.Join(includes, ", "))
+		}
+		if _, err = resolveManagementServers(newConf, w.log); err != nil {
+			w.log.WithFields(logrus.Fields{
+				"err": err,
+			}).Errorln("[Reload] Failed to reload")
+			w.reloadManager.failReloadAttempt(err)
+			continue
 		}
 		// Re-apply the new log level/formatter in place instead of swapping the
 		// w.log pointer: the signal loop and the fast-exit path read w.log
@@ -488,8 +496,6 @@ func (w *reloadWorker) run() {
 		w.reloadManager.setPendingReloadMetadata(reloadStartedAt, reloadStartedAtMono)
 		w.reloadManager.beginHandoff()
 		releaseReloadTransition()
-
-		w.reloadManager.refreshPprofServer(&w.pprofServer, newConf.Global.PprofPort)
 
 		notifyRunStateChange(w.runStateChanges)
 

@@ -10,7 +10,6 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -31,6 +30,7 @@ import (
 	"github.com/daeuniverse/dae/config"
 	"github.com/daeuniverse/dae/control"
 	"github.com/daeuniverse/dae/pkg/logger"
+	"github.com/daeuniverse/dae/pkg/metrics"
 	"github.com/okzk/sdnotify"
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -417,10 +417,15 @@ func (r *Runner) Run() (err error) {
 		currCancel:        currCancel,
 		listener:          listener,
 	}
-	if conf.Global.PprofPort != 0 {
-		pprofAddr := fmt.Sprintf("localhost:%d", conf.Global.PprofPort)
-		w.pprofServer = &http.Server{Addr: pprofAddr, Handler: nil}
-		go func() { _ = w.pprofServer.ListenAndServe() }()
+	w.metricsState = metrics.NewState()
+	w.metricsState.SetControlPlane(c)
+	w.mgmt.log = log
+	w.mgmt.registry = metrics.NewRegistry(w.metricsState)
+	if err := w.mgmt.start(conf); err != nil {
+		_ = listener.Close()
+		cancel()
+		_ = c.Close()
+		return fmt.Errorf("start management servers: %w", err)
 	}
 	sigs := make(chan os.Signal, 1)
 	// Keep internal wake-ups separate so queued OS signals cannot mask reload handoff notifications.
@@ -823,6 +828,8 @@ loop:
 					w.conf = handoff.preparedGeneration.conf
 					w.listener = handoff.preparedGeneration.listener
 					reloadManager.clearPendingStagedHandoff()
+					w.metricsState.SetControlPlane(w.c)
+					w.mgmt.apply(w.conf)
 
 					if oldListener != nil {
 						if err := oldListener.Close(); err != nil {
@@ -869,12 +876,9 @@ loop:
 
 	defer func() {
 		_ = sdnotify.Stopping()
-		if w.pprofServer != nil {
-			w.log.Infoln("Shutting down pprof server")
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			_ = w.pprofServer.Shutdown(ctx)
-			cancel()
-		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		w.mgmt.shutdown(ctx)
+		cancel()
 		_ = os.Remove(PidFilePath)
 	}()
 
