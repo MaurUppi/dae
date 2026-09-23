@@ -183,6 +183,8 @@ type collection struct {
 	MovingAverage     time.Duration
 	LastProbe         DialerProbeObservationSnapshot
 	Alive             atomic.Bool
+	CheckTotal        atomic.Uint64
+	CheckFailureTotal atomic.Uint64
 }
 
 func newCollection() *collection {
@@ -665,6 +667,63 @@ func getActiveDialerCount() int {
 	return poolActiveCount
 }
 
+// shouldSkipTcp6Probes returns true when tcp_check_url explicitly lists only IPv4
+// addresses (no explicit IPv6 entries).
+// This avoids unnecessary IPv6 TCP probes when the user's network doesn't support IPv6.
+// Returns false (keep IPv6 probes) when:
+//   - Explicit IPv6 addresses are found in config
+//   - No explicit IPs are given (DNS resolution might return IPv6)
+func shouldSkipTcp6Probes(raw []string) bool {
+	hasIpv6 := false
+	hasExplicitIpv4 := false
+
+	for i := 1; i < len(raw); i++ {
+		addr, err := netip.ParseAddr(raw[i])
+		if err != nil {
+			continue
+		}
+		if addr.Is6() {
+			hasIpv6 = true
+		} else {
+			hasExplicitIpv4 = true
+		}
+	}
+
+	if hasIpv6 {
+		return false
+	}
+	return hasExplicitIpv4
+}
+
+// shouldSkipUdp6Probes returns true when udp_check_dns explicitly lists only IPv4
+// addresses (no explicit IPv6 entries).
+func shouldSkipUdp6Probes(raw []string) bool {
+	hasIpv6 := false
+	hasExplicitIpv4 := false
+
+	for i := 1; i < len(raw); i++ {
+		addr, err := netip.ParseAddr(raw[i])
+		if err != nil {
+			continue
+		}
+		if addr.Is6() {
+			hasIpv6 = true
+		} else {
+			hasExplicitIpv4 = true
+		}
+	}
+
+	if hasIpv6 {
+		return false
+	}
+	return hasExplicitIpv4
+}
+
+// hasUdpDnsConfig returns true if udp_check_dns is configured.
+func hasUdpDnsConfig(raw []string) bool {
+	return len(raw) > 0
+}
+
 func (d *Dialer) aliveBackground() {
 	cycle := d.CheckInterval
 	if cycle <= 0 {
@@ -771,7 +830,35 @@ func (d *Dialer) aliveBackground() {
 		},
 		CheckFunc: makeDnsCheckFunc(func(o *CheckDnsOption) netip.Addr { return o.Ip6 }, &udpNetwork),
 	}
-	var CheckOpts = []*CheckOption{tcp4CheckOpt, tcp6CheckOpt, udp4CheckDnsOpt, udp6CheckDnsOpt}
+	// Build CheckOpts dynamically based on configuration:
+	//   - Skip IPv6 TCP probes when tcp_check_url only has explicit IPv4 addresses
+	//   - Skip IPv6 UDP DNS probes when udp_check_dns only has explicit IPv4 addresses
+	//   - Skip all UDP DNS probes when udp_check_dns is not configured
+	skipTcp6 := shouldSkipTcp6Probes(d.TcpCheckOptionRaw.Raw)
+	skipUdp6 := shouldSkipUdp6Probes(d.CheckDnsOptionRaw.Raw)
+	useUdpDns := hasUdpDnsConfig(d.CheckDnsOptionRaw.Raw)
+
+	var CheckOpts []*CheckOption
+	CheckOpts = append(CheckOpts, tcp4CheckOpt)
+	if !skipTcp6 {
+		CheckOpts = append(CheckOpts, tcp6CheckOpt)
+	}
+	if useUdpDns {
+		CheckOpts = append(CheckOpts, udp4CheckDnsOpt)
+		if !skipUdp6 {
+			CheckOpts = append(CheckOpts, udp6CheckDnsOpt)
+		}
+	}
+
+	if d.Log.IsLevelEnabled(logrus.DebugLevel) {
+		d.Log.WithFields(logrus.Fields{
+			"dialer":   d.property.Name,
+			"tcp4":     true,
+			"tcp6":     !skipTcp6,
+			"udp4_dns": useUdpDns,
+			"udp6_dns": useUdpDns && !skipUdp6,
+		}).Debugln("Connectivity check probes configured")
+	}
 
 	var unusedOnce bool
 	checkUnused := func() bool {
@@ -898,7 +985,9 @@ func (d *Dialer) aliveBackground() {
 			// WITHOUT any successes in this cycle. This allows partially-working dual-stack
 			// nodes (e.g. V4 OK, V6 broken) to eventually wash white their penalty.
 			d.NotifyPeriodicCheckResult(consts.L4ProtoStr_TCP, cycleRes.tcpSuccess, cycleRes.tcpFailure && !cycleRes.tcpSuccess)
-			d.NotifyPeriodicCheckResultForType(udp4CheckDnsOpt.networkType, cycleRes.udpSuccess, cycleRes.udpFailure && !cycleRes.udpSuccess)
+			if useUdpDns {
+				d.NotifyPeriodicCheckResultForType(udp4CheckDnsOpt.networkType, cycleRes.udpSuccess, cycleRes.udpFailure && !cycleRes.udpSuccess)
+			}
 		}
 
 		// Targeted checks don't disturb the periodic timer — only full checks do.
@@ -1080,6 +1169,29 @@ func (d *Dialer) NotifyCheckTcp() {
 
 func (d *Dialer) MustGetLatencies10(typ *NetworkType) *LatenciesN {
 	return d.mustGetCollection(typ).Latencies10
+}
+
+func (d *Dialer) GetCollectionState(typ *NetworkType) (alive bool, lastLatency, avg10, movingAvg time.Duration, hasLastLatency bool) {
+	d.collectionFineMu.Lock()
+	col := d.mustGetCollection(typ)
+	alive = col.Alive.Load()
+	movingAvg = col.MovingAverage
+	lastProbe := col.LastProbe
+	d.collectionFineMu.Unlock()
+	// Use LastProbe.Latency rather than Latencies10.LastLatency() so that
+	// timeout-penalty values (10 s injected on failure) are never surfaced
+	// as a real "last latency" reading.
+	if lastProbe.HasLatency {
+		lastLatency = lastProbe.Latency
+		hasLastLatency = true
+	}
+	avg10, _ = col.Latencies10.AvgLatency()
+	return
+}
+
+func (d *Dialer) GetCollectionCounters(typ *NetworkType) (checkTotal, checkFailureTotal uint64) {
+	col := d.mustGetCollection(typ)
+	return col.CheckTotal.Load(), col.CheckFailureTotal.Load()
 }
 
 // RegisterAliveDialerSet is thread-safe.
@@ -1351,6 +1463,7 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 	const maxAttempts = 2
 	var bestLatency time.Duration
 	checkedAt := time.Now()
+	d.mustGetCollection(opts.networkType).CheckTotal.Add(1)
 
 	for range maxAttempts {
 		ctx, cancel := context.WithTimeout(d.ctx, Timeout)
@@ -1423,6 +1536,7 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 			Alive:     false,
 			Message:   err.Error(),
 		}
+		collection.CheckFailureTotal.Add(1)
 		d.collectionFineMu.Unlock()
 
 		// Failure: mark unavailable only if there's an actual error. Teardown
