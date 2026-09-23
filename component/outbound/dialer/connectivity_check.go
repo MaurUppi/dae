@@ -667,61 +667,22 @@ func getActiveDialerCount() int {
 	return poolActiveCount
 }
 
-// shouldSkipTcp6Probes returns true when tcp_check_url explicitly lists only IPv4
-// addresses (no explicit IPv6 entries).
-// This avoids unnecessary IPv6 TCP probes when the user's network doesn't support IPv6.
-// Returns false (keep IPv6 probes) when:
-//   - Explicit IPv6 addresses are found in config
-//   - No explicit IPs are given (DNS resolution might return IPv6)
-func shouldSkipTcp6Probes(raw []string) bool {
-	hasIpv6 := false
-	hasExplicitIpv4 := false
-
-	for i := 1; i < len(raw); i++ {
-		addr, err := netip.ParseAddr(raw[i])
-		if err != nil {
-			continue
-		}
-		if addr.Is6() {
-			hasIpv6 = true
-		} else {
-			hasExplicitIpv4 = true
-		}
-	}
-
-	if hasIpv6 {
-		return false
-	}
-	return hasExplicitIpv4
-}
-
-// shouldSkipUdp6Probes returns true when udp_check_dns explicitly lists only IPv4
-// addresses (no explicit IPv6 entries).
-func shouldSkipUdp6Probes(raw []string) bool {
-	hasIpv6 := false
-	hasExplicitIpv4 := false
-
-	for i := 1; i < len(raw); i++ {
-		addr, err := netip.ParseAddr(raw[i])
-		if err != nil {
-			continue
-		}
-		if addr.Is6() {
-			hasIpv6 = true
-		} else {
-			hasExplicitIpv4 = true
-		}
-	}
-
-	if hasIpv6 {
-		return false
-	}
-	return hasExplicitIpv4
-}
-
 // hasUdpDnsConfig returns true if udp_check_dns is configured.
 func hasUdpDnsConfig(raw []string) bool {
 	return len(raw) > 0
+}
+
+// buildCheckOpts is the probe list for one dialer. tcp4 and tcp6 are always
+// included so a family without an applicable IP fails through ErrNoApplicableIP
+// instead of staying at its initial alive state. UDP DNS probes are included
+// only when udp_check_dns Raw is non-empty; an unconfigured family is not
+// probed and its alive state is left untouched.
+func buildCheckOpts(udpDnsRaw []string, tcp4, tcp6, udp4, udp6 *CheckOption) []*CheckOption {
+	opts := []*CheckOption{tcp4, tcp6}
+	if hasUdpDnsConfig(udpDnsRaw) {
+		opts = append(opts, udp4, udp6)
+	}
+	return opts
 }
 
 func (d *Dialer) aliveBackground() {
@@ -830,33 +791,19 @@ func (d *Dialer) aliveBackground() {
 		},
 		CheckFunc: makeDnsCheckFunc(func(o *CheckDnsOption) netip.Addr { return o.Ip6 }, &udpNetwork),
 	}
-	// Build CheckOpts dynamically based on configuration:
-	//   - Skip IPv6 TCP probes when tcp_check_url only has explicit IPv4 addresses
-	//   - Skip IPv6 UDP DNS probes when udp_check_dns only has explicit IPv4 addresses
-	//   - Skip all UDP DNS probes when udp_check_dns is not configured
-	skipTcp6 := shouldSkipTcp6Probes(d.TcpCheckOptionRaw.Raw)
-	skipUdp6 := shouldSkipUdp6Probes(d.CheckDnsOptionRaw.Raw)
+	// tcp6 stays in the list even for an explicit IPv4-only tcp_check_url:
+	// CheckFunc returns ErrNoApplicableIP and check() marks that family not
+	// alive. UDP DNS probes are omitted only when udp_check_dns is unset.
 	useUdpDns := hasUdpDnsConfig(d.CheckDnsOptionRaw.Raw)
-
-	var CheckOpts []*CheckOption
-	CheckOpts = append(CheckOpts, tcp4CheckOpt)
-	if !skipTcp6 {
-		CheckOpts = append(CheckOpts, tcp6CheckOpt)
-	}
-	if useUdpDns {
-		CheckOpts = append(CheckOpts, udp4CheckDnsOpt)
-		if !skipUdp6 {
-			CheckOpts = append(CheckOpts, udp6CheckDnsOpt)
-		}
-	}
+	CheckOpts := buildCheckOpts(d.CheckDnsOptionRaw.Raw, tcp4CheckOpt, tcp6CheckOpt, udp4CheckDnsOpt, udp6CheckDnsOpt)
 
 	if d.Log.IsLevelEnabled(logrus.DebugLevel) {
 		d.Log.WithFields(logrus.Fields{
 			"dialer":   d.property.Name,
 			"tcp4":     true,
-			"tcp6":     !skipTcp6,
+			"tcp6":     true,
 			"udp4_dns": useUdpDns,
-			"udp6_dns": useUdpDns && !skipUdp6,
+			"udp6_dns": useUdpDns,
 		}).Debugln("Connectivity check probes configured")
 	}
 
