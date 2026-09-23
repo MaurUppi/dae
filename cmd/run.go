@@ -823,13 +823,8 @@ loop:
 							}
 						}
 					}
-					w.c = handoff.preparedGeneration.controlPlane
-					w.currCancel = handoff.preparedGeneration.cancel
-					w.conf = handoff.preparedGeneration.conf
-					w.listener = handoff.preparedGeneration.listener
+					w.adoptPreparedGeneration(handoff.preparedGeneration)
 					reloadManager.clearPendingStagedHandoff()
-					w.metricsState.SetControlPlane(w.c)
-					w.mgmt.apply(w.conf)
 
 					if oldListener != nil {
 						if err := oldListener.Close(); err != nil {

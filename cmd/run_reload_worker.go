@@ -47,6 +47,19 @@ type reloadWorker struct {
 	mgmt         managementServers
 }
 
+// adoptPreparedGeneration publishes one prepared generation onto the worker:
+// the control plane, its cancel, config, and listener, then the metrics state
+// and the management listeners. clearPendingStagedHandoff stays at the call
+// site; neither step here reads the pending handoff.
+func (w *reloadWorker) adoptPreparedGeneration(gen *runtimeGeneration) {
+	w.c = gen.controlPlane
+	w.currCancel = gen.cancel
+	w.conf = gen.conf
+	w.listener = gen.listener
+	w.metricsState.SetControlPlane(w.c)
+	w.mgmt.apply(w.conf)
+}
+
 // attachPreparedSessionManager attaches the process-owned session manager to a
 // newly built control plane. A prior construction error is returned unchanged
 // so callers can keep their existing failure tails. An attach failure closes

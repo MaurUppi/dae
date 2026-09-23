@@ -61,8 +61,8 @@ func TestResolveManagementServers(t *testing.T) {
 		if plan.endpointCfg.ListenAddress != "127.0.0.1:5556" {
 			t.Fatalf("listen = %q, want explicit address", plan.endpointCfg.ListenAddress)
 		}
-		if !plan.endpointCfg.PprofEnabled {
-			t.Fatal("pprof_port still enables pprof on the endpoint mux")
+		if plan.endpointCfg.PprofEnabled {
+			t.Fatal("explicit endpoint address must not also mount /debug/pprof/")
 		}
 	})
 

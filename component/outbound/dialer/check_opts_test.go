@@ -28,7 +28,7 @@ func TestBuildCheckOpts(t *testing.T) {
 	udp6 := testCheckOption(consts.L4ProtoStr_UDP, consts.IpVersionStr_6)
 
 	t.Run("udp configured includes four probes in order", func(t *testing.T) {
-		got := buildCheckOpts([]string{"dns.google:53", "8.8.8.8"}, tcp4, tcp6, udp4, udp6)
+		got := buildCheckOpts(true, tcp4, tcp6, udp4, udp6)
 		want := []*CheckOption{tcp4, tcp6, udp4, udp6}
 		if len(got) != len(want) {
 			t.Fatalf("len = %d, want %d", len(got), len(want))
@@ -40,12 +40,10 @@ func TestBuildCheckOpts(t *testing.T) {
 		}
 	})
 
-	t.Run("empty udp raw keeps only tcp4 and tcp6", func(t *testing.T) {
-		for _, raw := range [][]string{nil, {}} {
-			got := buildCheckOpts(raw, tcp4, tcp6, udp4, udp6)
-			if len(got) != 2 || got[0] != tcp4 || got[1] != tcp6 {
-				t.Fatalf("raw=%v opts=%v, want tcp4 then tcp6", raw, got)
-			}
+	t.Run("udp disabled keeps only tcp4 and tcp6", func(t *testing.T) {
+		got := buildCheckOpts(false, tcp4, tcp6, udp4, udp6)
+		if len(got) != 2 || got[0] != tcp4 || got[1] != tcp6 {
+			t.Fatalf("opts=%v, want tcp4 then tcp6", got)
 		}
 	})
 }

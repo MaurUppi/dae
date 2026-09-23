@@ -688,10 +688,9 @@ func (c *DnsController) resolveDNSUpstream(
 	}
 
 	// Select best dial arguments (outbound, dialer, l4proto, ipversion, etc.)
-	// queryTotal counts the attempt even when selection fails; errTotal counts
-	// only a failed exchange or a question-echo mismatch.
-	upstreamMetric := c.getOrCreateDnsUpstreamMetric(upstreamName)
-	upstreamMetric.queryTotal.Add(1)
+	// A selection failure is not an upstream exchange: queryTotal starts at
+	// the forward, and errTotal counts only a failed exchange or a
+	// question-echo mismatch.
 	dialArg, err := c.runtime().chooseBestDnsDialer(ctx, dnsRequestSnapshotFromUDPRequest(req), upstream)
 	if err != nil {
 		return nil, err
@@ -700,6 +699,8 @@ func (c *DnsController) resolveDNSUpstream(
 	// Dial and send.
 	var respMsg *dnsmessage.Msg
 	var usedDialArg *dialArgument
+	upstreamMetric := c.getOrCreateDnsUpstreamMetric(upstreamName)
+	upstreamMetric.queryTotal.Add(1)
 	upstreamMetric.inFlight.Add(1)
 	forwardStart := time.Now()
 	respMsg, usedDialArg, err = c.forwardWithFallback(ctx, req, upstream, dialArg, data, isAsIs)

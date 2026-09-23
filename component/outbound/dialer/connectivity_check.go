@@ -675,11 +675,11 @@ func hasUdpDnsConfig(raw []string) bool {
 // buildCheckOpts is the probe list for one dialer. tcp4 and tcp6 are always
 // included so a family without an applicable IP fails through ErrNoApplicableIP
 // instead of staying at its initial alive state. UDP DNS probes are included
-// only when udp_check_dns Raw is non-empty; an unconfigured family is not
-// probed and its alive state is left untouched.
-func buildCheckOpts(udpDnsRaw []string, tcp4, tcp6, udp4, udp6 *CheckOption) []*CheckOption {
+// only when useUdpDns is set; an unconfigured family is not probed and its
+// alive state is left untouched.
+func buildCheckOpts(useUdpDns bool, tcp4, tcp6, udp4, udp6 *CheckOption) []*CheckOption {
 	opts := []*CheckOption{tcp4, tcp6}
-	if hasUdpDnsConfig(udpDnsRaw) {
+	if useUdpDns {
 		opts = append(opts, udp4, udp6)
 	}
 	return opts
@@ -795,7 +795,7 @@ func (d *Dialer) aliveBackground() {
 	// CheckFunc returns ErrNoApplicableIP and check() marks that family not
 	// alive. UDP DNS probes are omitted only when udp_check_dns is unset.
 	useUdpDns := hasUdpDnsConfig(d.CheckDnsOptionRaw.Raw)
-	CheckOpts := buildCheckOpts(d.CheckDnsOptionRaw.Raw, tcp4CheckOpt, tcp6CheckOpt, udp4CheckDnsOpt, udp6CheckDnsOpt)
+	CheckOpts := buildCheckOpts(useUdpDns, tcp4CheckOpt, tcp6CheckOpt, udp4CheckDnsOpt, udp6CheckDnsOpt)
 
 	if d.Log.IsLevelEnabled(logrus.DebugLevel) {
 		d.Log.WithFields(logrus.Fields{
