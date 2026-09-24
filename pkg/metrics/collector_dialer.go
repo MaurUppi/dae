@@ -141,7 +141,7 @@ func (c *DialerCollector) Collect(ch chan<- prometheus.Metric) {
 			ch <- prometheus.MustNewConstMetric(
 				c.groupAliveDialers,
 				prometheus.GaugeValue,
-				float64(set.AliveCount()),
+				float64(set.Len()),
 				group.Name,
 				dialerMetricNetworkTypes[i].String(),
 			)

@@ -126,7 +126,14 @@ REPORT_MD="$ARTIFACT_ROOT/report.md"
   echo
   for suite in "${suites[@]}"; do
     status="$(cat "$ARTIFACT_ROOT/$suite/status.txt" 2>/dev/null || echo 1)"
-    echo "- $suite: $([[ "$status" == "0" ]] && echo 'success' || echo 'failed')"
+    # A leftover marker must not relabel a failed suite as skipped.
+    if [[ "$status" == "0" && -f "$ARTIFACT_ROOT/$suite/skipped_base_incompatible" ]]; then
+      echo "- $suite: skipped (base incompatible)"
+    elif [[ "$status" == "0" ]]; then
+      echo "- $suite: success"
+    else
+      echo "- $suite: failed"
+    fi
   done
   for suite in "${suites[@]}"; do
     echo

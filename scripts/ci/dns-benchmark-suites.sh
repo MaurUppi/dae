@@ -35,7 +35,7 @@ dns_bench_suite_filter() {
   local suite="$1"
   case "$suite" in
     control_dns_cache)
-      echo "^BenchmarkDnsCache_(FillInto|IncludeAnyIp|IncludeIp)$"
+      echo "^BenchmarkDnsCache_FillIntoWithTTL$"
       ;;
     component_upstream_hotpath)
       echo "^BenchmarkUpstreamResolver_GetUpstream_(Serial|Parallel)$"

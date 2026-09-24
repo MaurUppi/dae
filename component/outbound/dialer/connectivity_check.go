@@ -37,6 +37,65 @@ import (
 
 const Timeout = 10 * time.Second
 
+// ErrNoApplicableIP is a sentinel error returned by CheckFunc when the health
+// check target has no DNS record for the requested IP version (e.g. an IPv4-only
+// node has no AAAA record). It is distinguished from a plain (false, nil) skip
+// so that check() can mark the node unavailable for that network type instead
+// of preserving the initial alive=true state and silently routing traffic to a
+// dead path.
+var ErrNoApplicableIP = stderrors.New("no applicable IP for this network type")
+
+// errCheckOptionUnavailable is a sentinel error returned by CheckFunc when the
+// check option itself cannot be built (e.g. the TCP check URL cannot be
+// resolved via the system resolver, or the DNS check target failed to parse).
+// Such failures are probe-infrastructure problems shared by every dialer of
+// the generation, not evidence about any single node's health, so check()
+// skips health-state punishment for them instead of flapping all nodes.
+//
+// Deliberate asymmetry with ErrNoApplicableIP: a check target without a record
+// for this IP version is still per-node-path evidence (traffic on that family
+// would hit the same wall), so it keeps punishing; a broken check option says
+// nothing about any path and must not punish.
+var errCheckOptionUnavailable = stderrors.New("check option unavailable")
+
+// wrapCheckOptionError classifies a check-option build failure. The sentinel
+// stays unexported because it is plumbing between CheckFunc closures and
+// check(); callers outside the package have no way to produce it.
+func wrapCheckOptionError(err error) error {
+	return fmt.Errorf("%w: %v", errCheckOptionUnavailable, err)
+}
+
+// isLifecycleTeardownError reports whether err carries no evidence about node
+// health because it was produced by dialer teardown.
+//
+// Cancellation-shaped errors are always teardown: the check ctx's explicit
+// cancel() runs only after CheckFunc has returned, so mid-probe cancellation
+// can only come from the parent dialer context (retirement/reload); a check
+// deadline expiry instead surfaces as context.DeadlineExceeded, which this
+// predicate does not match and which must be punished as a slow node.
+//
+// Closed-connection errors are teardown only when this dialer is actually
+// being retired (d.ctx done). While the dialer is live, net.ErrClosed is NOT
+// teardown: mux protocols in the outbound fork (anytls, juicity, ...) surface
+// net.ErrClosed when the remote side kills the session, and that must still
+// count as node evidence so the node can be punished.
+//
+// Note: an error that merely CONTAINS the text "context canceled" without
+// chaining context.Canceled does not take the unconditional leg and is
+// punished while the dialer is live. That narrowing is deliberate: every
+// in-tree producer chains context.Canceled (or is gated on d.ctx), so a bare
+// string match could only fire for foreign code, where erring toward node
+// evidence is the safe direction.
+func (d *Dialer) isLifecycleTeardownError(err error) bool {
+	if !commonerrors.IsCanceledOrClosed(err) {
+		return false
+	}
+	if stderrors.Is(err, context.Canceled) {
+		return true
+	}
+	return d.ctx.Err() != nil
+}
+
 type UdpHealthDomain uint8
 
 const (
@@ -145,6 +204,23 @@ func (d *Dialer) MustGetAlive(typ *NetworkType) bool {
 	return d.mustGetCollection(typ).Alive.Load()
 }
 
+// dnsBorrowedLatencyV4/V6 are immutable singletons for the data-UDP latency
+// borrow: allocating a fresh NetworkType per notification served nothing.
+var (
+	dnsBorrowedLatencyV4 = &NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       consts.IpVersionStr_4,
+		IsDns:           true,
+		UdpHealthDomain: UdpHealthDomainDns,
+	}
+	dnsBorrowedLatencyV6 = &NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       consts.IpVersionStr_6,
+		IsDns:           true,
+		UdpHealthDomain: UdpHealthDomainDns,
+	}
+)
+
 func (d *Dialer) SnapshotLastProbe(typ *NetworkType) DialerProbeObservationSnapshot {
 	if d == nil || typ == nil {
 		return DialerProbeObservationSnapshot{}
@@ -162,6 +238,20 @@ type collectionUpdate struct {
 	alive             bool
 	movingAverage     time.Duration
 	aliveDialerGroups []*AliveDialerSet
+	// borrowedGroups/borrowedAlive carry the data-UDP fan-out produced by a
+	// DNS-UDP domain update. The data-UDP domain has no latency probe of its
+	// own and borrows the DNS domain's latency (see
+	// snapshotLatencyForPolicy), but its AliveDialerSets are only notified
+	// while the domain itself is still dead (ReportAvailableTraffic gates on
+	// !MustGetAlive) - so without this fan-out their borrowed sorting
+	// latency freezes at the value captured on the revival.
+	//
+	// borrowedAlive is ALWAYS the data-UDP collection's own Alive.Load(), and
+	// borrowedGroups is snapshotted under the same collectionFineMu critical
+	// section as the update itself. Both notifications are delivered after
+	// that lock is released (see informDialerGroupUpdate).
+	borrowedGroups []*AliveDialerSet
+	borrowedAlive  bool
 }
 
 func (d *Dialer) hasAliveDialerSets(typ *NetworkType) bool {
@@ -175,8 +265,29 @@ func (d *Dialer) snapshotLatencyForPolicy(
 	typ *NetworkType,
 	policy consts.DialerSelectionPolicy,
 ) (rawLatency time.Duration, hasLatency bool) {
+	// Data-UDP has no latency probe of its own: real proxied UDP traffic only
+	// flips the alive flag and never records a delay, so its collection always
+	// reports hasLatency=false and node selection fell back to configuration
+	// order / add_latency only (see daeuniverse/dae#1072).
+	//
+	// Reuse the DNS-UDP health domain of the same dialer as a proxy signal:
+	// both domains traverse the very same upstream proxy channel (only the
+	// final destination differs by a few ms), so the DNS-UDP probe delay
+	// faithfully represents the channel quality seen by data-UDP. Only the
+	// latency is borrowed; the data-UDP alive state remains driven exclusively
+	// by real UDP traffic, preserving the deliberate isolation between the two
+	// health domains.
+	latencyType := typ
+	if typ.L4Proto == consts.L4ProtoStr_UDP && typ.EffectiveUdpHealthDomain() == UdpHealthDomainData {
+		switch typ.IpVersion {
+		case consts.IpVersionStr_6:
+			latencyType = dnsBorrowedLatencyV6
+		default:
+			latencyType = dnsBorrowedLatencyV4
+		}
+	}
 	d.collectionFineMu.RLock()
-	collection := d.mustGetCollection(typ)
+	collection := d.mustGetCollection(latencyType)
 	switch policy {
 	case consts.DialerSelectionPolicy_MinLastLatency:
 		rawLatency, hasLatency = collection.Latencies10.LastLatency()
@@ -189,13 +300,21 @@ func (d *Dialer) snapshotLatencyForPolicy(
 	d.collectionFineMu.RUnlock()
 
 	if hasLatency {
-		rawLatency += d.getBackoffPenaltyForType(typ)
+		penalty := d.getBackoffPenaltyForType(typ)
+		if latencyType != typ {
+			// A borrowed latency inherits the DNS domain's backoff penalty as
+			// well: when the DNS probe is failing, the channel is likely
+			// degraded for data-UDP too, and the penalty compensates for the
+			// otherwise stale success samples.
+			penalty = max(penalty, d.getBackoffPenaltyForType(latencyType))
+		}
+		rawLatency += penalty
 	}
 	return rawLatency, hasLatency
 }
 
 func (d *Dialer) snapshotAliveDialerGroupsLocked(collection *collection) []*AliveDialerSet {
-	if len(collection.AliveDialerSetSet) == 0 {
+	if collection == nil || len(collection.AliveDialerSetSet) == 0 {
 		return nil
 	}
 	groups := make([]*AliveDialerSet, 0, len(collection.AliveDialerSetSet))
@@ -203,6 +322,58 @@ func (d *Dialer) snapshotAliveDialerGroupsLocked(collection *collection) []*Aliv
 		groups = append(groups, a)
 	}
 	return groups
+}
+
+// dataUdpBorrowerGroupsLocked resolves, for a DNS-UDP domain update, the
+// same-ipversion data-UDP AliveDialerSets that borrow this domain's latency,
+// together with the data-UDP domain's OWN alive state.
+//
+// Callers must hold collectionFineMu: the whole point is that the fan-out
+// target set and its alive bit are snapshotted inside the very critical
+// section that produced the update. It performs no notification and no I/O.
+//
+// Lock order: AliveDialerSet.mu -> collectionFineMu is the established order
+// (NotifyLatencyChange holds the set lock while calling
+// snapshotLatencyForPolicy). This helper is only ever called with
+// collectionFineMu held and never takes a set lock, so the order is kept
+// one-way here; the delivery happens after the unlock.
+//
+// ok is false when typ is not a DNS-UDP domain or the data-UDP domain has no
+// registered sets, in which case the update has no borrowed fan-out.
+func (d *Dialer) dataUdpBorrowerGroupsLocked(typ *NetworkType) (groups []*AliveDialerSet, alive bool, ok bool) {
+	if typ == nil || typ.L4Proto != consts.L4ProtoStr_UDP ||
+		typ.EffectiveUdpHealthDomain() != UdpHealthDomainDns {
+		return nil, false, false
+	}
+	dataType := &NetworkType{
+		L4Proto:         consts.L4ProtoStr_UDP,
+		IpVersion:       typ.IpVersion,
+		UdpHealthDomain: UdpHealthDomainData,
+	}
+	collection := d.mustGetCollection(dataType)
+	if collection == nil {
+		return nil, false, false
+	}
+	groups = d.snapshotAliveDialerGroupsLocked(collection)
+	if len(groups) == 0 {
+		return nil, false, false
+	}
+	// The data-UDP alive flag must come from the data-UDP collection itself:
+	// borrowing the DNS domain's value would flip data-UDP aliveness from a
+	// DNS probe, which the health-domain split deliberately forbids.
+	return groups, collection.Alive.Load(), true
+}
+
+// attachBorrowedUdpFanOutLocked fills update's borrowed fan-out fields.
+// Callers must hold collectionFineMu.
+func (d *Dialer) attachBorrowedUdpFanOutLocked(typ *NetworkType, update *collectionUpdate) {
+	if update == nil {
+		return
+	}
+	if groups, alive, ok := d.dataUdpBorrowerGroupsLocked(typ); ok {
+		update.borrowedGroups = groups
+		update.borrowedAlive = alive
+	}
 }
 
 func parseIp46FromList(ip []string) *netutils.Ip46 {
@@ -227,17 +398,30 @@ type TcpCheckOption struct {
 	Method string
 }
 
-func ParseTcpCheckOption(ctx context.Context, rawURL []string, method string, resolverNetwork string) (opt *TcpCheckOption, err error) {
+func parseTcpCheckOption(ctx context.Context, rawURL []string, method string, resolverNetwork string, directDialer netproxy.Dialer, systemDNSResolver SystemDNSResolver) (opt *TcpCheckOption, err error) {
+	if directDialer == nil {
+		directDialer = direct.SymmetricDirect
+	}
 	if method == "" {
 		method = http.MethodGet
 	}
-	systemDns, err := netutils.SystemDns()
+	var systemDns netip.AddrPort
+	if systemDNSResolver == nil {
+		systemDns, err = netutils.SystemDns()
+	} else {
+		systemDns, err = systemDNSResolver.SystemDNS()
+	}
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if err != nil {
+		if err == nil {
+			return
+		}
+		if systemDNSResolver == nil {
 			_ = netutils.TryUpdateSystemDnsElapse(time.Second)
+		} else {
+			_ = systemDNSResolver.TryUpdateElapse(time.Second)
 		}
 	}()
 
@@ -252,7 +436,7 @@ func ParseTcpCheckOption(ctx context.Context, rawURL []string, method string, re
 	if len(rawURL) > 1 {
 		ip46 = parseIp46FromList(rawURL[1:])
 	} else {
-		ip46, _, _ = netutils.ResolveIp46(ctx, direct.SymmetricDirect, systemDns, u.Hostname(), resolverNetwork, false)
+		ip46, _, _ = netutils.ResolveIp46(ctx, directDialer, systemDns, u.Hostname(), resolverNetwork, false)
 		if !ip46.Ip4.IsValid() && !ip46.Ip6.IsValid() {
 			return nil, fmt.Errorf("ResolveIp46: no valid ip for %v", u.Hostname())
 		}
@@ -270,14 +454,27 @@ type CheckDnsOption struct {
 	*netutils.Ip46
 }
 
-func ParseCheckDnsOption(ctx context.Context, dnsHostPort []string, resolverNetwork string) (opt *CheckDnsOption, err error) {
-	systemDns, err := netutils.SystemDns()
+func parseCheckDNSOption(ctx context.Context, dnsHostPort []string, resolverNetwork string, directDialer netproxy.Dialer, systemDNSResolver SystemDNSResolver) (opt *CheckDnsOption, err error) {
+	if directDialer == nil {
+		directDialer = direct.SymmetricDirect
+	}
+	var systemDns netip.AddrPort
+	if systemDNSResolver == nil {
+		systemDns, err = netutils.SystemDns()
+	} else {
+		systemDns, err = systemDNSResolver.SystemDNS()
+	}
 	if err != nil {
 		return nil, err
 	}
 	defer func() {
-		if err != nil {
+		if err == nil {
+			return
+		}
+		if systemDNSResolver == nil {
 			_ = netutils.TryUpdateSystemDnsElapse(time.Second)
+		} else {
+			_ = systemDNSResolver.TryUpdateElapse(time.Second)
 		}
 	}()
 
@@ -291,13 +488,13 @@ func ParseCheckDnsOption(ctx context.Context, dnsHostPort []string, resolverNetw
 	}
 	port, err := strconv.ParseUint(_port, 10, 16)
 	if err != nil {
-		return nil, fmt.Errorf("bad port: %v", err)
+		return nil, fmt.Errorf("bad port: %w", err)
 	}
 	var ip46 *netutils.Ip46
 	if len(dnsHostPort) > 1 {
 		ip46 = parseIp46FromList(dnsHostPort[1:])
 	} else {
-		ip46, _, _ = netutils.ResolveIp46(ctx, direct.SymmetricDirect, systemDns, host, resolverNetwork, false)
+		ip46, _, _ = netutils.ResolveIp46(ctx, directDialer, systemDns, host, resolverNetwork, false)
 		if !ip46.Ip4.IsValid() && !ip46.Ip6.IsValid() {
 			return nil, fmt.Errorf("ResolveIp46: no valid ip for %v", host)
 		}
@@ -310,12 +507,14 @@ func ParseCheckDnsOption(ctx context.Context, dnsHostPort []string, resolverNetw
 }
 
 type TcpCheckOptionRaw struct {
-	opt             *TcpCheckOption
-	mu              sync.Mutex
-	Log             *logrus.Logger
-	Raw             []string
-	ResolverNetwork string
-	Method          string
+	opt               *TcpCheckOption
+	mu                sync.Mutex
+	Log               *logrus.Logger
+	Raw               []string
+	ResolverNetwork   string
+	Method            string
+	DirectDialer      netproxy.Dialer
+	SystemDNSResolver SystemDNSResolver
 }
 
 func (c *TcpCheckOptionRaw) Reset() {
@@ -332,7 +531,7 @@ func (c *TcpCheckOptionRaw) Option() (opt *TcpCheckOption, err error) {
 		defer cancel()
 		type contextKey string
 		ctx = context.WithValue(ctx, contextKey("logger"), c.Log)
-		tcpCheckOption, err := ParseTcpCheckOption(ctx, c.Raw, c.Method, c.ResolverNetwork)
+		tcpCheckOption, err := parseTcpCheckOption(ctx, c.Raw, c.Method, c.ResolverNetwork, c.DirectDialer, c.SystemDNSResolver)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse tcp_check_url: %w", err)
 		}
@@ -342,11 +541,13 @@ func (c *TcpCheckOptionRaw) Option() (opt *TcpCheckOption, err error) {
 }
 
 type CheckDnsOptionRaw struct {
-	opt             *CheckDnsOption
-	mu              sync.Mutex
-	Raw             []string
-	ResolverNetwork string
-	Somark          uint32
+	opt               *CheckDnsOption
+	mu                sync.Mutex
+	Raw               []string
+	ResolverNetwork   string
+	Somark            uint32
+	DirectDialer      netproxy.Dialer
+	SystemDNSResolver SystemDNSResolver
 }
 
 func (c *CheckDnsOptionRaw) Reset() {
@@ -361,7 +562,7 @@ func (c *CheckDnsOptionRaw) Option() (opt *CheckDnsOption, err error) {
 	if c.opt == nil {
 		ctx, cancel := context.WithTimeout(context.Background(), Timeout)
 		defer cancel()
-		udpCheckOption, err := ParseCheckDnsOption(ctx, c.Raw, c.ResolverNetwork)
+		udpCheckOption, err := parseCheckDNSOption(ctx, c.Raw, c.ResolverNetwork, c.DirectDialer, c.SystemDNSResolver)
 		if err != nil {
 			return nil, fmt.Errorf("failed to parse udp_check_dns: %w", err)
 		}
@@ -466,65 +667,33 @@ func getActiveDialerCount() int {
 	return poolActiveCount
 }
 
-// shouldSkipTcp6Probes returns true when tcp_check_url explicitly lists only IPv4
-// addresses (no explicit IPv6 entries).
-// This avoids unnecessary IPv6 TCP probes when the user's network doesn't support IPv6.
-// Returns false (keep IPv6 probes) when:
-//   - Explicit IPv6 addresses are found in config
-//   - No explicit IPs are given (DNS resolution might return IPv6)
-func shouldSkipTcp6Probes(raw []string) bool {
-	hasIpv6 := false
-	hasExplicitIpv4 := false
-
-	for i := 1; i < len(raw); i++ {
-		addr, err := netip.ParseAddr(raw[i])
-		if err != nil {
-			continue
-		}
-		if addr.Is6() {
-			hasIpv6 = true
-		} else {
-			hasExplicitIpv4 = true
-		}
-	}
-
-	if hasIpv6 {
-		return false
-	}
-	return hasExplicitIpv4
-}
-
-// shouldSkipUdp6Probes returns true when udp_check_dns explicitly lists only IPv4
-// addresses (no explicit IPv6 entries).
-func shouldSkipUdp6Probes(raw []string) bool {
-	hasIpv6 := false
-	hasExplicitIpv4 := false
-
-	for i := 1; i < len(raw); i++ {
-		addr, err := netip.ParseAddr(raw[i])
-		if err != nil {
-			continue
-		}
-		if addr.Is6() {
-			hasIpv6 = true
-		} else {
-			hasExplicitIpv4 = true
-		}
-	}
-
-	if hasIpv6 {
-		return false
-	}
-	return hasExplicitIpv4
-}
-
 // hasUdpDnsConfig returns true if udp_check_dns is configured.
 func hasUdpDnsConfig(raw []string) bool {
 	return len(raw) > 0
 }
 
+// buildCheckOpts is the probe list for one dialer. tcp4 and tcp6 are always
+// included so a family without an applicable IP fails through ErrNoApplicableIP
+// instead of staying at its initial alive state. UDP DNS probes are included
+// only when useUdpDns is set; an unconfigured family is not probed and its
+// alive state is left untouched.
+func buildCheckOpts(useUdpDns bool, tcp4, tcp6, udp4, udp6 *CheckOption) []*CheckOption {
+	opts := []*CheckOption{tcp4, tcp6}
+	if useUdpDns {
+		opts = append(opts, udp4, udp6)
+	}
+	return opts
+}
+
 func (d *Dialer) aliveBackground() {
 	cycle := d.CheckInterval
+	if cycle <= 0 {
+		// The daemon config layer enforces a positive interval, but a
+		// programmatic GlobalOption is unvalidated; a non-positive cycle
+		// would panic in fastrand.Int63n below on the first check. Fall back
+		// to the shortest sensible cadence instead of crashing.
+		cycle = time.Second
+	}
 	var tcpSomark uint32
 	var mptcp bool
 	if network, err := netproxy.ParseMagicNetwork(d.TcpCheckOptionRaw.ResolverNetwork); err == nil {
@@ -540,7 +709,7 @@ func (d *Dialer) aliveBackground() {
 		CheckFunc: func(ctx context.Context, typ *NetworkType) (ok bool, err error) {
 			opt, err := d.TcpCheckOptionRaw.Option()
 			if err != nil {
-				return false, err
+				return false, wrapCheckOptionError(err)
 			}
 			if !opt.Ip4.IsValid() {
 				d.Log.WithFields(logrus.Fields{
@@ -548,7 +717,7 @@ func (d *Dialer) aliveBackground() {
 					"dialer":  d.property.Name,
 					"network": typ.String(),
 				}).Debugln("Skip check due to no DNS record.")
-				return false, nil
+				return false, ErrNoApplicableIP
 			}
 			return d.HttpCheck(ctx, IdxTcp4, opt.Url, opt.Ip4, opt.Method, tcpSomark, mptcp)
 		},
@@ -562,7 +731,7 @@ func (d *Dialer) aliveBackground() {
 		CheckFunc: func(ctx context.Context, typ *NetworkType) (ok bool, err error) {
 			opt, err := d.TcpCheckOptionRaw.Option()
 			if err != nil {
-				return false, err
+				return false, wrapCheckOptionError(err)
 			}
 			if !opt.Ip6.IsValid() {
 				d.Log.WithFields(logrus.Fields{
@@ -570,7 +739,7 @@ func (d *Dialer) aliveBackground() {
 					"dialer":  d.property.Name,
 					"network": typ.String(),
 				}).Debugln("Skip check due to no DNS record.")
-				return false, nil
+				return false, ErrNoApplicableIP
 			}
 			return d.HttpCheck(ctx, IdxTcp6, opt.Url, opt.Ip6, opt.Method, tcpSomark, mptcp)
 		},
@@ -590,7 +759,7 @@ func (d *Dialer) aliveBackground() {
 		return func(ctx context.Context, typ *NetworkType) (ok bool, err error) {
 			opt, err := d.CheckDnsOptionRaw.Option()
 			if err != nil {
-				return false, err
+				return false, wrapCheckOptionError(err)
 			}
 			addr := ip(opt)
 			if !addr.IsValid() {
@@ -598,7 +767,7 @@ func (d *Dialer) aliveBackground() {
 					"link":    d.CheckDnsOptionRaw.Raw,
 					"network": typ.String(),
 				}).Debugln("Skip check due to no DNS record.")
-				return false, nil
+				return false, ErrNoApplicableIP
 			}
 			return d.DnsCheck(ctx, netip.AddrPortFrom(addr, opt.DnsPort), *network)
 		}
@@ -622,33 +791,19 @@ func (d *Dialer) aliveBackground() {
 		},
 		CheckFunc: makeDnsCheckFunc(func(o *CheckDnsOption) netip.Addr { return o.Ip6 }, &udpNetwork),
 	}
-	// Build CheckOpts dynamically based on configuration:
-	//   - Skip IPv6 TCP probes when tcp_check_url only has explicit IPv4 addresses
-	//   - Skip IPv6 UDP DNS probes when udp_check_dns only has explicit IPv4 addresses
-	//   - Skip all UDP DNS probes when udp_check_dns is not configured
-	skipTcp6 := shouldSkipTcp6Probes(d.TcpCheckOptionRaw.Raw)
-	skipUdp6 := shouldSkipUdp6Probes(d.CheckDnsOptionRaw.Raw)
+	// tcp6 stays in the list even for an explicit IPv4-only tcp_check_url:
+	// CheckFunc returns ErrNoApplicableIP and check() marks that family not
+	// alive. UDP DNS probes are omitted only when udp_check_dns is unset.
 	useUdpDns := hasUdpDnsConfig(d.CheckDnsOptionRaw.Raw)
-
-	var CheckOpts []*CheckOption
-	CheckOpts = append(CheckOpts, tcp4CheckOpt)
-	if !skipTcp6 {
-		CheckOpts = append(CheckOpts, tcp6CheckOpt)
-	}
-	if useUdpDns {
-		CheckOpts = append(CheckOpts, udp4CheckDnsOpt)
-		if !skipUdp6 {
-			CheckOpts = append(CheckOpts, udp6CheckDnsOpt)
-		}
-	}
+	CheckOpts := buildCheckOpts(useUdpDns, tcp4CheckOpt, tcp6CheckOpt, udp4CheckDnsOpt, udp6CheckDnsOpt)
 
 	if d.Log.IsLevelEnabled(logrus.DebugLevel) {
 		d.Log.WithFields(logrus.Fields{
 			"dialer":   d.property.Name,
 			"tcp4":     true,
-			"tcp6":     !skipTcp6,
+			"tcp6":     true,
 			"udp4_dns": useUdpDns,
-			"udp6_dns": useUdpDns && !skipUdp6,
+			"udp6_dns": useUdpDns,
 		}).Debugln("Connectivity check probes configured")
 	}
 
@@ -699,6 +854,10 @@ func (d *Dialer) aliveBackground() {
 	}
 	d.tickerMu.Lock()
 	d.ticker = time.NewTimer(initialDelay)
+	// A Timer's channel never changes across Reset, so capturing it once keeps
+	// the select below off d.ticker, which RetireForEstablishedFlows clears
+	// concurrently when a reload retires this dialer.
+	tickerC := d.ticker.C
 	d.tickerMu.Unlock()
 	defer func() {
 		d.tickerMu.Lock()
@@ -732,7 +891,7 @@ func (d *Dialer) aliveBackground() {
 		select {
 		case <-d.ctx.Done():
 			return
-		case <-d.ticker.C:
+		case <-tickerC:
 		case <-d.checkCh:
 		case <-d.checkDnsUdpCh:
 			checkFamily = consts.L4ProtoStr_UDP
@@ -755,6 +914,9 @@ func (d *Dialer) aliveBackground() {
 
 		var wg sync.WaitGroup
 		d.submitCheckTasks(workerPool, &wg, opts, checkFamily != "", cycleRes)
+		// Per-cycle waiter goroutine evaluated (round 11) and kept: it runs
+		// microseconds per interval across all dialers; alternatives either
+		// spin or complicate submit/failure accounting.
 		waitDone := make(chan struct{})
 		go func() {
 			wg.Wait()
@@ -832,38 +994,47 @@ func (d *Dialer) submitCheckTasks(workerPool *ants.Pool, wg *sync.WaitGroup, opt
 
 		wg.Add(1)
 		checkOpt := opt
-		err := workerPool.Submit(func() {
+		worker := func() {
 			defer wg.Done()
 			select {
 			case <-d.ctx.Done():
 				return
 			default:
 			}
-			if isResuscitation {
-				// Stagger resuscitation probes to prevent thundering herd.
-				// Random delay between 0 and 2 seconds, but allow reload/cancel
-				// to interrupt the probe before it starts.
-				timer := time.NewTimer(time.Duration(fastrand.Int63n(int64(2 * time.Second))))
-				defer timer.Stop()
+			_, _ = d.check(checkOpt, isResuscitation, cycle)
+		}
+		submitNow := func() {
+			// wg ownership: the worker Dones on completion; callers of
+			// submitNow must Done only when the worker never runs.
+			if err := workerPool.Submit(worker); err != nil {
+				// Nonblocking pools report overload immediately. Health checks are
+				// periodic, so skip this probe instead of spawning an unbounded
+				// goroutine that can outlive the dialer lifecycle.
+				wg.Done()
+			}
+		}
+
+		if isResuscitation {
+			// Stagger resuscitation probes to prevent thundering herd: a
+			// random delay between 0 and 2 seconds. The wait must happen
+			// OUTSIDE the worker pool — sleeping inside pool workers makes
+			// each emergency probe occupy a pool slot for the whole delay and,
+			// during a fleet-wide outage (every node resuscitating at once),
+			// starves the periodic checks of healthy nodes exactly when they
+			// matter most.
+			time.AfterFunc(time.Duration(fastrand.Int63n(int64(2*time.Second))), func() {
 				select {
 				case <-d.ctx.Done():
+					// Retired while waiting for the stagger: drop the task.
+					wg.Done()
 					return
-				case <-timer.C:
+				default:
 				}
-			}
-			_, _ = d.check(checkOpt, isResuscitation, cycle)
-		})
-
-		if err != nil {
-			// Nonblocking pools report overload immediately. Health checks are
-			// periodic, so skip this probe instead of spawning an unbounded
-			// goroutine that can outlive the dialer lifecycle.
-			wg.Done()
-			if stderrors.Is(err, ants.ErrPoolClosed) || stderrors.Is(err, ants.ErrPoolOverload) {
-				continue
-			}
+				submitNow()
+			})
 			continue
 		}
+		submitNow()
 	}
 }
 
@@ -873,6 +1044,19 @@ func (d *Dialer) NotifyCheck() {
 	case <-d.ctx.Done():
 		return
 	default:
+	}
+
+	// 2s cooldown, mirroring NotifyCheckDnsUdp/NotifyCheckTcp: NotifyCheck is
+	// reachable from the exported TriggerLatencyChecks API, and a fast GUI
+	// poller could otherwise drive back-to-back full checks (each occupying
+	// worker-pool slots and re-resolving the check URL).
+	now := time.Now().UnixNano()
+	pre := d.lastNotifyCheck.Load()
+	if now-pre < int64(2*time.Second) {
+		return
+	}
+	if !d.lastNotifyCheck.CompareAndSwap(pre, now) {
+		return
 	}
 
 	select {
@@ -991,7 +1175,9 @@ func (d *Dialer) logUnavailable(
 		if commonerrors.IsNetworkUnreachable(err) {
 			err = fmt.Errorf("network is unreachable")
 		} else if commonerrors.IsAddressNotSuitable(err) {
-			err = fmt.Errorf("IPv%v is not supported", network.IpVersion)
+			// EADDRNOTAVAIL means no usable source address of this family on
+			// the host, not that the family is unsupported per se.
+			err = fmt.Errorf("no usable IPv%v source address", network.IpVersion)
 		}
 		d.Log.WithFields(logrus.Fields{
 			"network": network.String(),
@@ -1076,6 +1262,7 @@ func (d *Dialer) markUnavailableInternal(typ *NetworkType, force bool, isTraffic
 		movingAverage:     collection.MovingAverage,
 		aliveDialerGroups: d.snapshotAliveDialerGroupsLocked(collection),
 	}
+	d.attachBorrowedUdpFanOutLocked(typ, &update)
 	d.collectionFineMu.Unlock()
 
 	if wasAlive != alive {
@@ -1110,6 +1297,7 @@ func (d *Dialer) markAvailable(typ *NetworkType, latency time.Duration) (collect
 		movingAverage:     collection.MovingAverage,
 		aliveDialerGroups: d.snapshotAliveDialerGroupsLocked(collection),
 	}
+	d.attachBorrowedUdpFanOutLocked(typ, &update)
 	d.collectionFineMu.Unlock()
 
 	// Notify about health check success.
@@ -1138,6 +1326,7 @@ func (d *Dialer) markAvailableTraffic(typ *NetworkType) collectionUpdate {
 		movingAverage:     collection.MovingAverage,
 		aliveDialerGroups: d.snapshotAliveDialerGroupsLocked(collection),
 	}
+	d.attachBorrowedUdpFanOutLocked(typ, &update)
 	d.collectionFineMu.Unlock()
 
 	isRevival := !wasAlive
@@ -1151,6 +1340,15 @@ func (d *Dialer) markAvailableTraffic(typ *NetworkType) collectionUpdate {
 func (d *Dialer) informDialerGroupUpdate(update collectionUpdate) {
 	for _, a := range update.aliveDialerGroups {
 		a.NotifyLatencyChange(d, update.alive)
+	}
+	// Borrowed fan-out (data-UDP domains of the same ipversion). Delivered
+	// here, i.e. strictly AFTER collectionFineMu was released: the
+	// established lock order is AliveDialerSet.mu -> collectionFineMu
+	// (NotifyLatencyChange holds the set lock while snapshotLatencyForPolicy
+	// takes the collection lock), so notifying inside the critical section
+	// that produced the snapshot would invert the order and deadlock.
+	for _, a := range update.borrowedGroups {
+		a.NotifyLatencyChange(d, update.borrowedAlive)
 	}
 }
 
@@ -1207,19 +1405,14 @@ func (d *Dialer) ReportAvailableTraffic(typ *NetworkType) {
 	}
 }
 
-// Check performs a basic connectivity check.
-// Backward compatibility wrapper for check(opts, false, nil).
-func (d *Dialer) Check(opts *CheckOption) (ok bool, err error) {
-	return d.check(opts, false, nil)
-}
-
+// check performs a basic connectivity check for one dialer.
 func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResult) (ok bool, err error) {
 	const maxAttempts = 2
 	var bestLatency time.Duration
 	checkedAt := time.Now()
 	d.mustGetCollection(opts.networkType).CheckTotal.Add(1)
 
-	for i := 0; i < maxAttempts; i++ {
+	for range maxAttempts {
 		ctx, cancel := context.WithTimeout(d.ctx, Timeout)
 		start := time.Now()
 		ok, err = opts.CheckFunc(ctx, opts.networkType)
@@ -1234,13 +1427,17 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 		if stderrors.Is(err, context.Canceled) {
 			break
 		}
-		if err == nil {
-			// No applicable IP; skip.
+		if err == nil || stderrors.Is(err, ErrNoApplicableIP) || stderrors.Is(err, errCheckOptionUnavailable) {
+			// No applicable IP, a plain skip, or a probe-infrastructure
+			// failure (check option cannot be built); don't retry — the DNS
+			// record or the option will not change between two attempts
+			// within the same check cycle.
 			break
 		}
 		// Retry on actual error.
 	}
-	if ok && err == nil {
+	switch {
+	case ok && err == nil:
 		d.collectionFineMu.Lock()
 		collection := d.mustGetCollection(opts.networkType)
 		collection.LastProbe = DialerProbeObservationSnapshot{
@@ -1278,7 +1475,7 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 			d.Log.WithFields(fields).Debugln("Connectivity Check")
 		}
 		d.informDialerGroupUpdate(update)
-	} else if err != nil && !stderrors.Is(err, context.Canceled) {
+	case err != nil && !d.isLifecycleTeardownError(err) && !stderrors.Is(err, errCheckOptionUnavailable):
 		d.collectionFineMu.Lock()
 		collection := d.mustGetCollection(opts.networkType)
 		collection.LastProbe = DialerProbeObservationSnapshot{
@@ -1289,7 +1486,10 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 		collection.CheckFailureTotal.Add(1)
 		d.collectionFineMu.Unlock()
 
-		// Failure: mark unavailable only if there's an actual error.
+		// Failure: mark unavailable only if there's an actual error. Teardown
+		// errors racing dialer retirement and probe-infrastructure failures
+		// carry no evidence about node health and must not poison dialer
+		// state or the process-global proxy failure tracker.
 		d.logUnavailable(opts.networkType, err)
 		d.informDialerGroupUpdate(d.markUnavailable(opts.networkType))
 
@@ -1301,6 +1501,20 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 				cycle.udpFailure = true
 			}
 			cycle.Unlock()
+		}
+	case stderrors.Is(err, errCheckOptionUnavailable):
+		// Probe-infrastructure failure: health state is preserved. Warn at a
+		// limited rate so a persistent misconfiguration (e.g. an unresolvable
+		// tcp_check_url) stays observable instead of silently keeping every
+		// node at its initial alive state.
+		now := time.Now().UnixNano()
+		if pre := d.lastCheckOptionWarn.Load(); now-pre > int64(time.Minute) {
+			if d.lastCheckOptionWarn.CompareAndSwap(pre, now) {
+				d.Log.WithFields(logrus.Fields{
+					"network": opts.networkType.String(),
+					"node":    d.property.Name,
+				}).Warnf("Connectivity check option unavailable; node health state preserved: %v", err)
+			}
 		}
 	}
 	// Skip update when (ok=false, err=nil): preserve existing alive state.
@@ -1319,8 +1533,7 @@ func (d *Dialer) HttpCheck(ctx context.Context, networkIdx int, u *netutils.URL,
 	}
 	resp, err := cli.Do(req)
 	if err != nil {
-		var netErr net.Error
-		if stderrors.As(err, &netErr); netErr.Timeout() {
+		if netErr, ok := stderrors.AsType[net.Error](err); ok && netErr.Timeout() {
 			err = fmt.Errorf("timeout")
 		}
 		return false, err

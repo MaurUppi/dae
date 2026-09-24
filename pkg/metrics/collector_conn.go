@@ -51,7 +51,7 @@ func NewConnCollector(state *State) *ConnCollector {
 		),
 		udpConnectionsTotal: prometheus.NewDesc(
 			"dae_udp_connections_total",
-			"Total number of new proxied UDP endpoint associations with successful first packet",
+			"Total number of UDP endpoints created (first datagram accepted)",
 			[]string{"protocol", "group"},
 			nil,
 		),
@@ -75,7 +75,7 @@ func (c *ConnCollector) Collect(ch chan<- prometheus.Metric) {
 		return
 	}
 	ch <- prometheus.MustNewConstMetric(c.tcpConnectionsActive, prometheus.GaugeValue, float64(cp.ActiveTCPConnections()))
-	ch <- prometheus.MustNewConstMetric(c.udpEndpointsActive, prometheus.GaugeValue, float64(control.DefaultUdpEndpointPool.Count()))
+	ch <- prometheus.MustNewConstMetric(c.udpEndpointsActive, prometheus.GaugeValue, float64(control.DefaultUdpEndpointPool.Len()))
 	ch <- prometheus.MustNewConstMetric(c.udpTaskQueuesActive, prometheus.GaugeValue, float64(control.DefaultUdpTaskPool.Count()))
 
 	tcpSnapshot := cp.TcpConnectionTotalsSnapshot()

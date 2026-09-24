@@ -1,5 +1,10 @@
 //go:build ignore
 
+/*
+ * SPDX-License-Identifier: AGPL-3.0-only
+ * Copyright (c) 2022-2026, daeuniverse Organization <dae@v2raya.org>
+ */
+
 package control
 
 import (
@@ -10,10 +15,7 @@ import (
 	dnsmessage "github.com/miekg/dns"
 )
 
-var (
-	benchDnsCacheMsgSink  dnsmessage.Msg
-	benchDnsCacheBoolSink bool
-)
+var benchDnsCacheBytesSink []byte
 
 func benchmarkDnsCache() *DnsCache {
 	return &DnsCache{
@@ -48,33 +50,20 @@ func benchmarkDnsRequest() *dnsmessage.Msg {
 	return msg
 }
 
-func BenchmarkDnsCache_FillInto(b *testing.B) {
+func BenchmarkDnsCache_FillIntoWithTTL(b *testing.B) {
 	cache := benchmarkDnsCache()
 	req := benchmarkDnsRequest()
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		msg := *req
-		cache.FillInto(&msg)
-		benchDnsCacheMsgSink = msg
+	now := time.Now()
+	if _, err := cache.FillIntoWithTTL(req, now); err != nil {
+		b.Fatal(err)
 	}
-}
-
-func BenchmarkDnsCache_IncludeAnyIp(b *testing.B) {
-	cache := benchmarkDnsCache()
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		benchDnsCacheBoolSink = cache.IncludeAnyIp()
-	}
-}
-
-func BenchmarkDnsCache_IncludeIp(b *testing.B) {
-	cache := benchmarkDnsCache()
-	ip := netip.MustParseAddr("192.0.2.1")
-	b.ReportAllocs()
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		benchDnsCacheBoolSink = cache.IncludeIp(ip)
+		packed, err := cache.FillIntoWithTTL(req, now)
+		if err != nil {
+			b.Fatal(err)
+		}
+		benchDnsCacheBytesSink = packed
 	}
 }

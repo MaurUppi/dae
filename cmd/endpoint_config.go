@@ -24,11 +24,11 @@ func endpointConfigFromGlobal(conf *config.Config, log *logrus.Logger) metricsht
 		TlsKey:            conf.Global.EndpointTlsKey,
 		PrometheusEnabled: conf.Global.EndpointPrometheusEnabled,
 		PrometheusPath:    conf.Global.EndpointPrometheusPath,
-		PprofEnabled:      conf.Global.PprofPort != 0,
 	}
 	if cfg.ListenAddress == "" && conf.Global.PprofPort != 0 {
 		log.Warnln("pprof_port is deprecated, please use endpoint_listen_address instead")
 		cfg.ListenAddress = fmt.Sprintf("localhost:%d", conf.Global.PprofPort)
+		cfg.PprofEnabled = true
 	}
 	return cfg
 }
