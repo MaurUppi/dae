@@ -19,7 +19,6 @@
   "editable": true,
   "fiscalYearStartMonth": 0,
   "graphTooltip": 1,
-  "id": 32,
   "links": [],
   "panels": [
     {
@@ -40,7 +39,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Number of alive proxy dialers (network=tcp4, all groups)",
+      "description": "Number of alive proxy dialers for the selected network ($network) and groups ($group). An IPv6 family (tcp6/udp6) whose check target has no IPv6 address fails every check (ErrNoApplicableIP) and reports alive=0; this is not a node outage.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -101,7 +100,7 @@
           "refId": "A"
         }
       ],
-      "title": "Alive Dialers",
+      "title": "有效节点",
       "type": "stat"
     },
     {
@@ -166,7 +165,7 @@
           "refId": "A"
         }
       ],
-      "title": "Active TCP Conn",
+      "title": "TCP活跃数",
       "type": "stat"
     },
     {
@@ -231,7 +230,7 @@
           "refId": "A"
         }
       ],
-      "title": "DNS Query Rate",
+      "title": "DNS 查询频率",
       "type": "stat"
     },
     {
@@ -272,7 +271,7 @@
       },
       "gridPos": {
         "h": 3,
-        "w": 3,
+        "w": 4,
         "x": 9,
         "y": 1
       },
@@ -301,12 +300,12 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "rate(dae_dns_cache_hit_total[$__rate_interval]) / clamp_min(rate(dae_dns_query_total[$__rate_interval]), 0.001)",
+          "expr": "(rate(dae_dns_cache_hit_total[$__rate_interval]) - rate(dae_dns_cache_lazy_hit_total[$__rate_interval])) / clamp_min(rate(dae_dns_query_total[$__rate_interval]), 0.001)",
           "legendFormat": "Hit Ratio",
           "refId": "A"
         }
       ],
-      "title": "DNS Cache Fresh Hit Ratio",
+      "title": "DNS 缓存命中率",
       "type": "stat"
     },
     {
@@ -336,8 +335,8 @@
       },
       "gridPos": {
         "h": 3,
-        "w": 4,
-        "x": 12,
+        "w": 5,
+        "x": 13,
         "y": 1
       },
       "id": 105,
@@ -419,8 +418,8 @@
       },
       "gridPos": {
         "h": 3,
-        "w": 4,
-        "x": 16,
+        "w": 5,
+        "x": 18,
         "y": 1
       },
       "id": 106,
@@ -448,7 +447,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "process_resident_memory_bytes",
+          "expr": "process_resident_memory_bytes{job=\"dae\"}",
           "instant": true,
           "legendFormat": "RSS",
           "refId": "A"
@@ -462,7 +461,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Cumulative bytes uploaded and downloaded since last process start. Resets on restart.",
+      "description": "Cumulative bytes uploaded and downloaded, kept per control plane. Resets on process restart and on config reload.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -514,10 +513,10 @@
         ]
       },
       "gridPos": {
-        "h": 3,
-        "w": 4,
-        "x": 20,
-        "y": 1
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 4
       },
       "id": 702,
       "options": {
@@ -560,7 +559,7 @@
           "refId": "B"
         }
       ],
-      "title": "Cumulative Traffic",
+      "title": "累计流量（重启或重载后重新计算）",
       "type": "stat"
     },
     {
@@ -568,7 +567,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Real-time upload and download throughput sampled by the runtime traffic statistics engine (250 ms buckets). These are direct gauge values — no rate() needed.",
+      "description": "Real-time upload and download throughput from the runtime traffic statistics engine: bytes over the last 1 s, aggregated from 250 ms buckets. These are direct gauge values — no rate() needed.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -655,8 +654,8 @@
       },
       "gridPos": {
         "h": 5,
-        "w": 24,
-        "x": 0,
+        "w": 17,
+        "x": 6,
         "y": 4
       },
       "id": 701,
@@ -780,7 +779,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "1 - sum(increase(dae_health_check_failure_total{network=\"$network\", group=~\"$group\", group!~\"block|direct\"}[$__range])) / sum(increase(dae_health_check_total{network=\"$network\", group=~\"$group\", group!~\"block|direct\"}[$__range]))",
+          "expr": "clamp_min(1 - sum(increase(dae_health_check_failure_total{network=\"$network\", group=~\"$group\", group!~\"block|direct\"}[$__range])) / clamp_min(sum(increase(dae_health_check_total{network=\"$network\", group=~\"$group\", group!~\"block|direct\"}[$__range])), 1), 0)",
           "legendFormat": "__auto",
           "range": true,
           "refId": "A"
@@ -794,6 +793,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
+      "description": "时间范围内所选 network（$network）健康检查失败的累计次数（排除 block/direct 组）。失败包括连接错误，以及 tcp6/udp6 检查目标无 IPv6 地址时的 ErrNoApplicableIP（每次检查都计为失败，节点 alive=0）。尚未完成首次探测的节点（0ms）没有检查记录，不计入。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -894,7 +894,7 @@
       },
       "gridPos": {
         "h": 3,
-        "w": 18,
+        "w": 17,
         "x": 6,
         "y": 10
       },
@@ -928,28 +928,15 @@
           "refId": "A"
         }
       ],
-      "title": "Alive Dialers by Group (network=$network)",
+      "title": "有效节点 分组明细 (network=$network)",
       "type": "stat"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 13
-      },
-      "id": 300,
-      "panels": [],
-      "title": "Dialer Latency",
-      "type": "row"
     },
     {
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Most recent health check round-trip latency per dialer, displayed in milliseconds. Zero means no health check data yet (e.g., block/direct built-ins).",
+      "description": "每个存活 dialer 最近一次健康检查的实际延迟（network=$network）。0ms（灰色）= 节点存活但尚未完成首次探测（check_interval=900s）；非 0ms 为真实探测延迟。已失败（alive=0）的节点不显示。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -962,8 +949,12 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "gray",
                 "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
               },
               {
                 "color": "#EAB839",
@@ -983,7 +974,7 @@
         "h": 10,
         "w": 12,
         "x": 0,
-        "y": 14
+        "y": 13
       },
       "id": 301,
       "options": {
@@ -1020,7 +1011,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sort(dae_dialer_latency_last_seconds{network=\"$network\", group=~\"$group\", group!~\"block|direct\"} * 1000)",
+          "expr": "sort_desc(\n  (\n    (dae_dialer_latency_last_seconds{network=\"$network\", group=~\"$group\", group!~\"block|direct\"} * 1000)\n    and (dae_dialer_alive{network=\"$network\", group=~\"$group\", group!~\"block|direct\"} == 1)\n  )\n  or (0 * (dae_dialer_alive{network=\"$network\", group=~\"$group\", group!~\"block|direct\"} == 1))\n)",
           "instant": true,
           "legendFormat": "{{group}} / {{dialer}}",
           "range": false,
@@ -1036,7 +1027,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "EWMA (thick line) smooths out noise from individual health checks. Instantaneous (thin) shows raw last-check latency. EWMA = current best estimate of dialer health.",
+      "description": "EWMA（指数加权移动平均，α=0.5）与最新瞬时延迟对比。0ms（灰色）= 节点存活但尚未完成首次探测，EWMA 尚未初始化；非 0ms 为路由决策使用的真实 EWMA 值。",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1048,8 +1039,12 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "green",
+                "color": "gray",
                 "value": null
+              },
+              {
+                "color": "green",
+                "value": 1
               },
               {
                 "color": "red",
@@ -1071,9 +1066,9 @@
       },
       "gridPos": {
         "h": 10,
-        "w": 12,
+        "w": 11,
         "x": 12,
-        "y": 14
+        "y": 13
       },
       "id": 302,
       "options": {
@@ -1110,7 +1105,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sort(dae_dialer_latency_moving_avg_seconds{network=\"$network\", group=~\"$group\", group!~\"block|direct\"} * 1000)",
+          "expr": "sort_desc(\n  (\n    (dae_dialer_latency_moving_avg_seconds{network=\"$network\", group=~\"$group\", group!~\"block|direct\"} * 1000)\n    and (dae_dialer_alive{network=\"$network\", group=~\"$group\", group!~\"block|direct\"} == 1)\n  )\n  or (0 * (dae_dialer_alive{network=\"$network\", group=~\"$group\", group!~\"block|direct\"} == 1))\n)",
           "instant": true,
           "legendFormat": "{{group}} / {{dialer}}",
           "range": false,
@@ -1122,7 +1117,7 @@
             "uid": "${datasource}"
           },
           "editorMode": "code",
-          "expr": "sort(dae_dialer_latency_last_seconds{network=\"$network\", group=~\"$group\", group!~\"block|direct\"} * 1000)",
+          "expr": "sort_desc(\n  (\n    (dae_dialer_latency_last_seconds{network=\"$network\", group=~\"$group\", group!~\"block|direct\"} * 1000)\n    and (dae_dialer_alive{network=\"$network\", group=~\"$group\", group!~\"block|direct\"} == 1)\n  )\n  or (0 * (dae_dialer_alive{network=\"$network\", group=~\"$group\", group!~\"block|direct\"} == 1))\n)",
           "hide": true,
           "instant": true,
           "legendFormat": "{{group}} / {{dialer}} (instant)",
@@ -1140,7 +1135,7 @@
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 24
+        "y": 23
       },
       "id": 400,
       "panels": [],
@@ -1169,9 +1164,9 @@
       },
       "gridPos": {
         "h": 9,
-        "w": 24,
+        "w": 23,
         "x": 0,
-        "y": 25
+        "y": 24
       },
       "id": 409,
       "interval": "30s",
@@ -1192,7 +1187,7 @@
           "color": "rgba(255,0,255,0.7)"
         },
         "filterValues": {
-          "le": 1e-09
+          "le": 1e-9
         },
         "legend": {
           "show": true
@@ -1228,6 +1223,7 @@
         }
       ],
       "title": "DNS Response Latency Heatmap",
+      "transparent": true,
       "type": "heatmap"
     },
     {
@@ -1235,7 +1231,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "DNS upstream forwarding attempt and error rates per upstream server. High error rates indicate upstream availability issues.",
+      "description": "DNS upstream exchange and error rates per upstream server. A query is counted once an upstream dialer has been selected (selection failures are not counted) and includes singleflight leaders and background cache refreshes. Errors are failed exchanges plus replies that do not echo the request question (dropped as possible spoofing or cross-talk).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1315,9 +1311,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 7,
         "x": 0,
-        "y": 34
+        "y": 33
       },
       "id": 405,
       "options": {
@@ -1364,7 +1360,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "DNS upstream round-trip latency percentiles per upstream server. Measures time from forwarding request to receiving response.",
+      "description": "DNS upstream round-trip latency percentiles per upstream server, observed for every upstream exchange (including failed ones) from forwarding the request to receiving the response or error, fallback attempts included.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1425,8 +1421,8 @@
       "gridPos": {
         "h": 8,
         "w": 8,
-        "x": 8,
-        "y": 34
+        "x": 7,
+        "y": 33
       },
       "id": 406,
       "options": {
@@ -1593,8 +1589,8 @@
       "gridPos": {
         "h": 8,
         "w": 8,
-        "x": 16,
-        "y": 34
+        "x": 15,
+        "y": 33
       },
       "id": 403,
       "options": {
@@ -1650,7 +1646,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "DNS query rate broken down by cache outcome: fresh hit (served from valid cache), lazy/stale hit (reserved for future stale-while-revalidate — currently always 0), and miss (derived from per-upstream forwarded query rate).",
+      "description": "DNS query rate by cache outcome. Cache Hit = fresh hits only, cache_hit − lazy_hit (served from a valid cache entry); Lazy (Stale) Hit = stale entry served while a background refresh runs; Cache Miss = total − cache_hit (not answered from cache: upstream-resolved, rejected, refused, or a suppressed non-preferred cached answer). dae_dns_cache_hit_total already includes lazy hits and counts each request at most once.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1779,9 +1775,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 7,
         "x": 0,
-        "y": 42
+        "y": 41
       },
       "id": 401,
       "options": {
@@ -1815,7 +1811,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "rate(dae_dns_cache_hit_total[$__rate_interval])",
+          "expr": "(rate(dae_dns_cache_hit_total[$__rate_interval]) - rate(dae_dns_cache_lazy_hit_total[$__rate_interval]))",
           "legendFormat": "Cache Hit",
           "refId": "B"
         },
@@ -1825,6 +1821,7 @@
             "uid": "${datasource}"
           },
           "expr": "rate(dae_dns_cache_lazy_hit_total[$__rate_interval])",
+          "hide": true,
           "legendFormat": "Lazy (Stale) Hit",
           "refId": "C"
         },
@@ -1833,7 +1830,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(rate(dae_dns_upstream_query_total[$__rate_interval]))",
+          "expr": "clamp_min(rate(dae_dns_query_total[$__rate_interval]) - rate(dae_dns_cache_hit_total[$__rate_interval]), 0)",
           "legendFormat": "Cache Miss",
           "refId": "D"
         }
@@ -1846,7 +1843,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "Fresh hit ratio = cache_hit / total_queries. Total hit ratio includes stale (lazy) hits served during background refresh. Lower fresh hit ratio with higher total hit ratio indicates active background refresh. Stale-while-revalidate is not yet implemented upstream; the lazy-hit term is reserved and always 0, so Total and Fresh overlap today.",
+      "description": "Fresh hit ratio = (cache_hit − lazy_hit) / total_queries. Total hit ratio = cache_hit / total_queries; cache_hit already includes stale (lazy) hits served during background refresh. The gap between the two lines is the share of queries answered stale while a refresh runs.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -1903,18 +1900,46 @@
           },
           "unit": "percentunit"
         },
-        "overrides": []
+        "overrides": [
+          {
+            "__systemRef": "hideSeriesFrom",
+            "matcher": {
+              "id": "byNames",
+              "options": {
+                "mode": "exclude",
+                "names": [
+                  "Fresh Hit Ratio"
+                ],
+                "prefix": "All except:",
+                "readOnly": true
+              }
+            },
+            "properties": [
+              {
+                "id": "custom.hideFrom",
+                "value": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": true
+                }
+              }
+            ]
+          }
+        ]
       },
       "gridPos": {
         "h": 8,
         "w": 8,
-        "x": 8,
-        "y": 42
+        "x": 7,
+        "y": 41
       },
       "id": 402,
       "options": {
         "legend": {
-          "calcs": [],
+          "calcs": [
+            "lastNotNull",
+            "mean"
+          ],
           "displayMode": "list",
           "placement": "bottom",
           "showLegend": true
@@ -1932,7 +1957,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "rate(dae_dns_cache_hit_total[$__rate_interval]) / clamp_min(rate(dae_dns_query_total[$__rate_interval]), 0.001)",
+          "expr": "(rate(dae_dns_cache_hit_total[$__rate_interval]) - rate(dae_dns_cache_lazy_hit_total[$__rate_interval])) / clamp_min(rate(dae_dns_query_total[$__rate_interval]), 0.001)",
+          "hide": false,
           "legendFormat": "Fresh Hit Ratio",
           "refId": "A"
         },
@@ -1941,7 +1967,8 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "(rate(dae_dns_cache_hit_total[$__rate_interval]) + rate(dae_dns_cache_lazy_hit_total[$__rate_interval])) / clamp_min(rate(dae_dns_query_total[$__rate_interval]), 0.001)",
+          "expr": "rate(dae_dns_cache_hit_total[$__rate_interval]) / clamp_min(rate(dae_dns_query_total[$__rate_interval]), 0.001)",
+          "hide": true,
           "legendFormat": "Total Hit Ratio (incl. stale)",
           "refId": "B"
         }
@@ -1954,7 +1981,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "DNS cache entries currently cached, forwarder connections cached, and refused/rejected query counts.",
+      "description": "DNS response cache entries, cached forwarder connections, and per-second rates of rejected queries (routing reject verdict, empty answer) and refused queries (concurrency limit exceeded, REFUSED).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2046,8 +2073,8 @@
       "gridPos": {
         "h": 8,
         "w": 8,
-        "x": 16,
-        "y": 42
+        "x": 15,
+        "y": 41
       },
       "id": 407,
       "options": {
@@ -2108,12 +2135,228 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "DNS query concurrency in use — client DNS queries currently being handled by dae (inc on `HandleWithResponseWriter_` entry, dec on return). A concurrency limit is enforced (ConcurrencyLimit, default 16384); queries beyond it are answered REFUSED and counted in dae_dns_refused_total. Persistent non-zero values indicate slow upstream or head-of-line queueing.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 5,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 2,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "In Use"
+            },
+            "properties": [
+              {
+                "id": "color",
+                "value": {
+                  "fixedColor": "orange",
+                  "mode": "fixed"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 12,
+        "x": 0,
+        "y": 49
+      },
+      "id": 404,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dae_dns_concurrency_in_use",
+          "legendFormat": "In Use",
+          "refId": "A"
+        }
+      ],
+      "title": "DNS Concurrency In Use",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "description": "Number of in-flight DNS requests currently being forwarded to each upstream. Persistently high values suggest slow upstream or high concurrency.",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "axisBorderShow": false,
+            "axisCenteredZero": false,
+            "axisColorMode": "text",
+            "axisLabel": "",
+            "axisPlacement": "auto",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "drawStyle": "line",
+            "fillOpacity": 20,
+            "gradientMode": "none",
+            "hideFrom": {
+              "legend": false,
+              "tooltip": false,
+              "viz": false
+            },
+            "insertNulls": false,
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "pointSize": 5,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "group": "A",
+              "mode": "none"
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "mappings": [],
+          "min": 0,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 11,
+        "x": 12,
+        "y": 49
+      },
+      "id": 408,
+      "options": {
+        "legend": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "hideZeros": false,
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "dae_dns_forwarder_in_flight",
+          "legendFormat": "{{upstream}}",
+          "refId": "A"
+        }
+      ],
+      "title": "DNS Forwarder In-Flight (per upstream)",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 50
+        "y": 57
       },
       "id": 500,
       "panels": [],
@@ -2187,7 +2430,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 51
+        "y": 58
       },
       "id": 501,
       "options": {
@@ -2286,9 +2529,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 11,
         "x": 12,
-        "y": 51
+        "y": 58
       },
       "id": 502,
       "options": {
@@ -2344,7 +2587,7 @@
         "type": "prometheus",
         "uid": "${datasource}"
       },
-      "description": "UDP new endpoint association rate per group and protocol. Each increment is a new NAT mapping created for a UDP flow.",
+      "description": "UDP new endpoint rate per group and protocol. Each increment is one UDP endpoint created whose first datagram was accepted (counted once per endpoint, not per packet).",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -2406,7 +2649,7 @@
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 59
+        "y": 66
       },
       "id": 503,
       "options": {
@@ -2505,9 +2748,9 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 11,
         "x": 12,
-        "y": 59
+        "y": 66
       },
       "id": 504,
       "options": {
@@ -2548,348 +2791,21 @@
       "type": "timeseries"
     },
     {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 67
-      },
-      "id": 600,
-      "panels": [],
-      "title": "Go Runtime & Process",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "description": "CPU time consumed per second. Value of 1.0 = one full CPU core. Values > number of cores indicate compute saturation.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "percentunit"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 0,
-        "y": 68
-      },
-      "id": 603,
-      "options": {
-        "legend": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "11.5.2",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "rate(process_cpu_seconds_total[$__rate_interval])",
-          "legendFormat": "CPU Usage",
-          "refId": "A"
-        }
-      ],
-      "title": "CPU Usage",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "description": "Go heap memory: allocated (in-use objects) vs. in-use heap spans. Sustained growth between GC cycles indicates memory pressure.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "bytes"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 68
-      },
-      "id": 602,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "pluginVersion": "11.5.2",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "go_memstats_heap_alloc_bytes",
-          "legendFormat": "Heap Alloc",
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "go_memstats_heap_inuse_bytes",
-          "legendFormat": "Heap In-Use",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "process_resident_memory_bytes",
-          "legendFormat": "RSS",
-          "refId": "C"
-        }
-      ],
-      "title": "Memory",
-      "type": "timeseries"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      },
-      "description": "Number of goroutines. Sudden spikes may indicate goroutine leak. Gradual growth under load is normal.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 10,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 2,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "min": 0,
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 16,
-        "y": 68
-      },
-      "id": 601,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "multi",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "11.5.2",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "go_goroutines",
-          "legendFormat": "Goroutines",
-          "refId": "A"
-        }
-      ],
-      "title": "Goroutines",
-      "type": "timeseries"
-    },
-    {
       "collapsed": true,
       "gridPos": {
         "h": 1,
         "w": 24,
         "x": 0,
-        "y": 76
+        "y": 74
       },
-      "id": 605,
+      "id": 600,
       "panels": [
         {
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "DNS query concurrency in use — saturation gauge counting client DNS queries currently being handled by dae (inc on `HandleWithResponseWriter_` entry, dec on return). No hard limit is enforced upstream; persistent non-zero values indicate slow upstream or head-of-line queueing.",
+          "description": "CPU time consumed per second. Value of 1.0 = one full CPU core. Values > number of cores indicate compute saturation.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -2904,7 +2820,7 @@
                 "barAlignment": 0,
                 "barWidthFactor": 0.6,
                 "drawStyle": "line",
-                "fillOpacity": 5,
+                "fillOpacity": 10,
                 "gradientMode": "none",
                 "hideFrom": {
                   "legend": false,
@@ -2934,8 +2850,7 @@
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "green",
-                    "value": null
+                    "color": "green"
                   },
                   {
                     "color": "red",
@@ -2943,33 +2858,17 @@
                   }
                 ]
               },
-              "unit": "short"
+              "unit": "percentunit"
             },
-            "overrides": [
-              {
-                "matcher": {
-                  "id": "byName",
-                  "options": "In Use"
-                },
-                "properties": [
-                  {
-                    "id": "color",
-                    "value": {
-                      "fixedColor": "orange",
-                      "mode": "fixed"
-                    }
-                  }
-                ]
-              }
-            ]
+            "overrides": []
           },
           "gridPos": {
             "h": 8,
-            "w": 8,
+            "w": 12,
             "x": 0,
-            "y": 81
+            "y": 75
           },
-          "id": 404,
+          "id": 603,
           "options": {
             "legend": {
               "calcs": [
@@ -2982,7 +2881,7 @@
             "tooltip": {
               "hideZeros": false,
               "mode": "multi",
-              "sort": "desc"
+              "sort": "none"
             }
           },
           "pluginVersion": "11.5.2",
@@ -2992,12 +2891,12 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "dae_dns_concurrency_in_use",
-              "legendFormat": "In Use",
+              "expr": "rate(process_cpu_seconds_total{job=\"dae\"}[$__rate_interval])",
+              "legendFormat": "CPU Usage",
               "refId": "A"
             }
           ],
-          "title": "DNS Concurrency In Use",
+          "title": "CPU Usage",
           "type": "timeseries"
         },
         {
@@ -3005,7 +2904,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "description": "Number of in-flight DNS requests currently being forwarded to each upstream. Persistently high values suggest slow upstream or high concurrency.",
+          "description": "Go heap memory: allocated (in-use objects) vs. in-use heap spans. Sustained growth between GC cycles indicates memory pressure.",
           "fieldConfig": {
             "defaults": {
               "color": {
@@ -3020,107 +2919,7 @@
                 "barAlignment": 0,
                 "barWidthFactor": 0.6,
                 "drawStyle": "line",
-                "fillOpacity": 20,
-                "gradientMode": "none",
-                "hideFrom": {
-                  "legend": false,
-                  "tooltip": false,
-                  "viz": false
-                },
-                "insertNulls": false,
-                "lineInterpolation": "linear",
-                "lineWidth": 1,
-                "pointSize": 5,
-                "scaleDistribution": {
-                  "type": "linear"
-                },
-                "showPoints": "never",
-                "spanNulls": false,
-                "stacking": {
-                  "group": "A",
-                  "mode": "none"
-                },
-                "thresholdsStyle": {
-                  "mode": "off"
-                }
-              },
-              "mappings": [],
-              "min": 0,
-              "thresholds": {
-                "mode": "absolute",
-                "steps": [
-                  {
-                    "color": "green",
-                    "value": null
-                  },
-                  {
-                    "color": "red",
-                    "value": 80
-                  }
-                ]
-              },
-              "unit": "short"
-            },
-            "overrides": []
-          },
-          "gridPos": {
-            "h": 8,
-            "w": 8,
-            "x": 8,
-            "y": 81
-          },
-          "id": 408,
-          "options": {
-            "legend": {
-              "calcs": [
-                "lastNotNull"
-              ],
-              "displayMode": "list",
-              "placement": "bottom",
-              "showLegend": true
-            },
-            "tooltip": {
-              "hideZeros": false,
-              "mode": "multi",
-              "sort": "desc"
-            }
-          },
-          "pluginVersion": "11.5.2",
-          "targets": [
-            {
-              "datasource": {
-                "type": "prometheus",
-                "uid": "${datasource}"
-              },
-              "expr": "dae_dns_forwarder_in_flight",
-              "legendFormat": "{{upstream}}",
-              "refId": "A"
-            }
-          ],
-          "title": "DNS Forwarder In-Flight (per upstream)",
-          "type": "timeseries"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "description": "GC pause duration percentiles. p99 > 10ms may cause latency spikes in proxy handling. Consider GOGC tuning if consistently high.",
-          "fieldConfig": {
-            "defaults": {
-              "color": {
-                "mode": "palette-classic"
-              },
-              "custom": {
-                "axisBorderShow": false,
-                "axisCenteredZero": false,
-                "axisColorMode": "text",
-                "axisLabel": "",
-                "axisPlacement": "auto",
-                "barAlignment": 0,
-                "barWidthFactor": 0.6,
-                "drawStyle": "line",
-                "fillOpacity": 5,
+                "fillOpacity": 10,
                 "gradientMode": "none",
                 "hideFrom": {
                   "legend": false,
@@ -3150,8 +2949,7 @@
                 "mode": "absolute",
                 "steps": [
                   {
-                    "color": "green",
-                    "value": null
+                    "color": "green"
                   },
                   {
                     "color": "red",
@@ -3159,17 +2957,17 @@
                   }
                 ]
               },
-              "unit": "ms"
+              "unit": "bytes"
             },
             "overrides": []
           },
           "gridPos": {
             "h": 8,
-            "w": 6,
-            "x": 16,
-            "y": 81
+            "w": 11,
+            "x": 12,
+            "y": 75
           },
-          "id": 604,
+          "id": 602,
           "options": {
             "legend": {
               "calcs": [],
@@ -3190,7 +2988,219 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "histogram_quantile(0.50, sum(rate(go_gc_duration_seconds_bucket[$__rate_interval])) by (le)) * 1000",
+              "expr": "go_memstats_heap_alloc_bytes{job=\"dae\"}",
+              "legendFormat": "Heap Alloc",
+              "refId": "A"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "go_memstats_heap_inuse_bytes{job=\"dae\"}",
+              "legendFormat": "Heap In-Use",
+              "refId": "B"
+            },
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "process_resident_memory_bytes{job=\"dae\"}",
+              "legendFormat": "RSS",
+              "refId": "C"
+            }
+          ],
+          "title": "Memory",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "Number of goroutines. Sudden spikes may indicate goroutine leak. Gradual growth under load is normal.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 10,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "short"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 12,
+            "x": 0,
+            "y": 83
+          },
+          "id": 601,
+          "options": {
+            "legend": {
+              "calcs": [],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "none"
+            }
+          },
+          "pluginVersion": "11.5.2",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "go_goroutines{job=\"dae\"}",
+              "legendFormat": "Goroutines",
+              "refId": "A"
+            }
+          ],
+          "title": "Goroutines",
+          "type": "timeseries"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "description": "GC pause duration: p50 and max (quantile 1 / 1.0 is the maximum pause in the summary window, not p99). Max > 10ms may cause latency spikes in proxy handling. Consider GOGC tuning if consistently high.",
+          "fieldConfig": {
+            "defaults": {
+              "color": {
+                "mode": "palette-classic"
+              },
+              "custom": {
+                "axisBorderShow": false,
+                "axisCenteredZero": false,
+                "axisColorMode": "text",
+                "axisLabel": "",
+                "axisPlacement": "auto",
+                "barAlignment": 0,
+                "barWidthFactor": 0.6,
+                "drawStyle": "line",
+                "fillOpacity": 5,
+                "gradientMode": "none",
+                "hideFrom": {
+                  "legend": false,
+                  "tooltip": false,
+                  "viz": false
+                },
+                "insertNulls": false,
+                "lineInterpolation": "linear",
+                "lineWidth": 2,
+                "pointSize": 5,
+                "scaleDistribution": {
+                  "type": "linear"
+                },
+                "showPoints": "never",
+                "spanNulls": false,
+                "stacking": {
+                  "group": "A",
+                  "mode": "none"
+                },
+                "thresholdsStyle": {
+                  "mode": "off"
+                }
+              },
+              "mappings": [],
+              "min": 0,
+              "thresholds": {
+                "mode": "absolute",
+                "steps": [
+                  {
+                    "color": "green"
+                  },
+                  {
+                    "color": "red",
+                    "value": 80
+                  }
+                ]
+              },
+              "unit": "ms"
+            },
+            "overrides": []
+          },
+          "gridPos": {
+            "h": 8,
+            "w": 11,
+            "x": 12,
+            "y": 83
+          },
+          "id": 705,
+          "options": {
+            "legend": {
+              "calcs": [],
+              "displayMode": "list",
+              "placement": "bottom",
+              "showLegend": true
+            },
+            "tooltip": {
+              "hideZeros": false,
+              "mode": "multi",
+              "sort": "desc"
+            }
+          },
+          "pluginVersion": "11.5.2",
+          "targets": [
+            {
+              "datasource": {
+                "type": "prometheus",
+                "uid": "${datasource}"
+              },
+              "expr": "go_gc_duration_seconds{job=\"dae\", quantile=\"0.5\"} * 1000",
               "legendFormat": "p50",
               "refId": "A"
             },
@@ -3199,8 +3209,8 @@
                 "type": "prometheus",
                 "uid": "${datasource}"
               },
-              "expr": "histogram_quantile(0.99, sum(rate(go_gc_duration_seconds_bucket[$__rate_interval])) by (le)) * 1000",
-              "legendFormat": "p99",
+              "expr": "go_gc_duration_seconds{job=\"dae\", quantile=~\"1|1.0\"} * 1000",
+              "legendFormat": "max",
               "refId": "B"
             }
           ],
@@ -3208,7 +3218,7 @@
           "type": "timeseries"
         }
       ],
-      "title": "temp",
+      "title": "Go Runtime & Process",
       "type": "row"
     }
   ],
@@ -3223,10 +3233,7 @@
   "templating": {
     "list": [
       {
-        "current": {
-          "text": "prometheus",
-          "value": "cfa1zpgywwiyod"
-        },
+        "current": {},
         "includeAll": false,
         "label": "Datasource",
         "name": "datasource",
@@ -3239,14 +3246,10 @@
       {
         "current": {
           "text": [
-            "FC-Netflix",
-            "FC-TW",
-            "FC-HK"
+            "All"
           ],
           "value": [
-            "FC-Netflix",
-            "FC-TW",
-            "FC-HK"
+            "$__all"
           ]
         },
         "datasource": {
@@ -3277,13 +3280,13 @@
           "type": "prometheus",
           "uid": "${datasource}"
         },
-        "definition": "label_values(dae_dialer_latency_last_seconds{network!~\".*DNS.*\"}, network)",
+        "definition": "label_values(dae_dialer_alive{network!~\".*DNS.*\"}, network)",
         "includeAll": false,
         "label": "Network",
         "name": "network",
         "options": [],
         "query": {
-          "query": "label_values(dae_dialer_latency_last_seconds{network!~\".*DNS.*\"}, network)",
+          "query": "label_values(dae_dialer_alive{network!~\".*DNS.*\"}, network)",
           "refId": "StandardVariableQuery"
         },
         "refresh": 2,
@@ -3294,13 +3297,12 @@
     ]
   },
   "time": {
-    "from": "now-15m",
+    "from": "now-1h",
     "to": "now"
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "dae Transparent Proxy-NEW",
-  "uid": "dae-metrics-v2",
-  "version": 5,
+  "title": "dae Transparent Proxy-v6",
+  "uid": "dae-metrics-v6",
   "weekStart": ""
 }
