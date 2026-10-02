@@ -397,8 +397,8 @@ func ValidateFilePermissionForbidden(path string, fi os.FileInfo, forbidden os.F
 
 ## 6. 未核实事项清单
 
-1. #1015 rebase 到 `e3fee8f` 是否有冲突，以及冲突范围。（初步判断，数据未充分确认）
-2. 修复提交能否直接 cherry-pick 到 fork main。理论上可以，因为文件相同，但未实际执行。
+1. ~~#1015 rebase 到 `e3fee8f` 是否有冲突~~ → **已核实：无冲突**，两边改动的文件零重叠，见 §7。
+2. ~~修复提交能否直接 cherry-pick~~ → **已核实**：同一个修复提交已干净应用到 fork 和 #1015 分支，见 §7。
 3. 多订阅用户中同组节点重名的实际比例。（此信息/数据暂未核实完毕）
 4. Caddy、acme.sh 等工具默认生成的证书和私钥权限。（此信息/数据暂未核实完毕）
 5. 上游维护者对 `endpoint_prometheus_enabled` 默认值和面板存放位置的偏好。
@@ -406,7 +406,45 @@ func ValidateFilePermissionForbidden(path string, fi os.FileInfo, forbidden os.F
 
 ---
 
-## 7. 后续思考
+## 7. 实施状态（2026-10-02 更新）
+
+本节记录 P0–P2 修复的落地情况。按要求，P3 项本轮不处理。
+
+### 7.1 各项发现的处理结果
+
+| 发现 | 状态 | 实施要点 |
+|---|---|---|
+| §3.1 P0-1 `link` 凭据泄露 | 已修复 | 删除 `dae_node_latency_seconds` / `dae_node_alive`；`control/node_latency.go` 回退后与上游 v2.1.1 完全一致 |
+| §3.2 P0-2 重名导致 500 | 已修复 | 新增 `dialerMetricName` 按组追加 ` #N` 后缀；`promhttp` 改用 `ContinueOnError` |
+| §3.3 P1-1 TCP 序列重复 | 已修复 | 改为遍历 `dialer.StandardHealthKeys()`（6 个）；删除 `DialerGroup.AliveDialerSets()`，`dialer_group.go` 回退后与上游一致 |
+| §3.4 P1-2 HELP 语义 | 已修复 | HELP 改为“包含 lazy 命中”；fork 的两个旧面板已替换为 #1015 的面板（blob `21ce121`） |
+| §3.5 P1-3 认证被关闭 | 已修复 | 用户名和密码必须成对配置，否则启动或 reload 报错 |
+| §3.6 P1-4 示例监听地址 | 已修复 | 示例改为 `127.0.0.1:5556`，并补充暴露风险说明 |
+| §3.7 P2-1 TLS 权限 | 已修复 | 改用禁止位检查：证书为 `0o022`，私钥为 `0o077`；删除两个旧函数，新增 `ValidateFilePermissionForbidden` |
+| §3.8 P2-2 检查计数 | 已修复 | `CheckTotal` 只在得出结论的成功或失败分支中计数 |
+| §3.9 P2-3 rebase | 本地已完成，待推送 | 与上游 6 个新提交**没有任何文件重叠**，rebase 无冲突。面板位置仍留给维护者决定 |
+
+### 7.2 提交
+
+- fork（分支 `claude/laughing-sagan-ndu7a8`）：
+  - `3c02657 fix(metrics): address review findings`：18 个文件，+322/−127。不计测试和 `example.dae`，生产代码净减约 42 行。
+  - `ea9f706 docs(metrics): replace stale fork dashboards ...`：仅 fork 侧。
+- 上游 PR 分支：本地分支 `upstream-prep/metrics-endpoint-clean`，已 rebase 到上游 `e3fee8f`，修复提交为 `5c9df67`。**尚未推送**，因为需要 force-push 到 `feat/metrics-endpoint-clean`。
+
+### 7.3 验证
+
+验证环境与 CI 等价：go1.26.0、CI 的 GOEXPERIMENT、`-tags dae_stub_ebpf`、golangci-lint v2.11.0。
+
+| 检查 | fork 分支 | 上游 rebase 分支 |
+|---|---|---|
+| `go build ./...` 与 `go vet` | 通过 | 6 个提交**逐个**通过 |
+| 相关包测试（pkg、common、component/outbound、dialer、cmd、config、control 中与 metrics 相关的部分） | 通过 | 通过 |
+| golangci-lint | 0 issues | 0 issues |
+| gofmt 与 `go mod tidy` | 无差异 | 无差异 |
+
+新增的回归测试已在**修复前的代码**上确认会失败：`TestPrometheusHandlerSurvivesCollectorError` 得到 `status=500`，`TestCheck_CountersCountOnlyVerdicts` 得到 `total=3`。修复后两者都通过。
+
+## 8. 后续思考
 
 - **Q1：** 如果 `/metrics` 已经被暴露过一段时间，凭据可能已经写入 Prometheus 或远程存储。是否需要提醒已部署 fork 的用户轮换节点密码或 UUID，并清理 TSDB 中的 `dae_node_*` 序列？
 - **Q2：** 健康指标的 `network` 维度应该直接对齐 v2.1.1 的“健康域”（`tcp`、`dns_udp`、`data_udp`），还是继续沿用 `tcp4(DNS)` 这类旧字符串以保证兼容？这个选择会影响上游长期的指标契约。
