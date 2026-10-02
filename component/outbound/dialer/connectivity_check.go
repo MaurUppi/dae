@@ -1410,7 +1410,6 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 	const maxAttempts = 2
 	var bestLatency time.Duration
 	checkedAt := time.Now()
-	d.mustGetCollection(opts.networkType).CheckTotal.Add(1)
 
 	for range maxAttempts {
 		ctx, cancel := context.WithTimeout(d.ctx, Timeout)
@@ -1440,6 +1439,9 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 	case ok && err == nil:
 		d.collectionFineMu.Lock()
 		collection := d.mustGetCollection(opts.networkType)
+		// CheckTotal counts only checks that produced a verdict; skips,
+		// teardown and probe-infrastructure failures carry no health evidence.
+		collection.CheckTotal.Add(1)
 		collection.LastProbe = DialerProbeObservationSnapshot{
 			CheckedAt:  checkedAt,
 			Alive:      true,
@@ -1483,6 +1485,7 @@ func (d *Dialer) check(opts *CheckOption, isResuscitation bool, cycle *cycleResu
 			Alive:     false,
 			Message:   err.Error(),
 		}
+		collection.CheckTotal.Add(1)
 		collection.CheckFailureTotal.Add(1)
 		d.collectionFineMu.Unlock()
 
