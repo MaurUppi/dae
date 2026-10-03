@@ -422,14 +422,17 @@ func ValidateFilePermissionForbidden(path string, fi os.FileInfo, forbidden os.F
 | §3.6 P1-4 示例监听地址 | 已修复 | 示例改为 `127.0.0.1:5556`，并补充暴露风险说明 |
 | §3.7 P2-1 TLS 权限 | 已修复 | 改用禁止位检查：证书为 `0o022`，私钥为 `0o077`；删除两个旧函数，新增 `ValidateFilePermissionForbidden` |
 | §3.8 P2-2 检查计数 | 已修复 | `CheckTotal` 只在得出结论的成功或失败分支中计数 |
-| §3.9 P2-3 rebase | 本地已完成，待推送 | 与上游 6 个新提交**没有任何文件重叠**，rebase 无冲突。面板位置仍留给维护者决定 |
+| §3.9 P2-3 rebase 与面板 | 已完成并推送 | 与上游 6 个新提交**没有任何文件重叠**，rebase 无冲突。面板保留在 `.plan/metrics/`，内容见 §7.4 |
 
 ### 7.2 提交
 
 - fork（分支 `claude/laughing-sagan-ndu7a8`）：
   - `3c02657 fix(metrics): address review findings`：18 个文件，+322/−127。不计测试和 `example.dae`，生产代码净减约 42 行。
   - `ea9f706 docs(metrics): replace stale fork dashboards ...`：仅 fork 侧。
-- 上游 PR 分支：本地分支 `upstream-prep/metrics-endpoint-clean`，已 rebase 到上游 `e3fee8f`，修复提交为 `5c9df67`。**尚未推送**，因为需要 force-push 到 `feat/metrics-endpoint-clean`。
+- 上游 PR 分支 `feat/metrics-endpoint-clean`（daeuniverse/dae#1015 的 head）：
+  - 用 `--force-with-lease`（基准 `8573436`）推送：`8573436...5c9df67`。5 个原提交已 rebase 到上游 `e3fee8f`，修复提交为 `5c9df67`。
+  - 面板修订作为快进提交追加：`5c9df67..8502e56`。
+- fork 分支：`3006758` 依据 v6 修订面板，并把文件名改回 `dae Transparent Proxy-Grafana_dashboard.json`。
 
 ### 7.3 验证
 
@@ -443,6 +446,23 @@ func ValidateFilePermissionForbidden(path string, fi os.FileInfo, forbidden os.F
 | gofmt 与 `go mod tidy` | 无差异 | 无差异 |
 
 新增的回归测试已在**修复前的代码**上确认会失败：`TestPrometheusHandlerSurvivesCollectorError` 得到 `status=500`，`TestCheck_CountersCountOnlyVerdicts` 得到 `total=3`。修复后两者都通过。
+
+### 7.4 Grafana 面板（基于 v6 修订）
+
+- 基准文件：用户上传的 `dae_Transparent_Proxy-v6-1790143652539.json`。经深度比对，#1015 原有面板正是 v6 去除环境信息后的版本，差异只有 `id`、`version`、数据源 uid 和组选择这 4 处。v6 本身不使用 `dae_node_*`，DNS 缓存公式也已按“hit 含 lazy”编写。
+- 修订内容（文本 diff 共 5 行）：
+  - **D1**：`network` 变量去掉 `network!~".*DNS.*"` 过滤。重复的 `tcp4(DNS)` 序列已不存在，这个过滤器现在只会隐藏唯一被主动探测的 `udp4(DNS)`/`udp6(DNS)`。
+  - **D2**：健康检查成功率的分母改为 `(sum(...) > 0)`。数据 UDP 没有检查，原写法会显示误导性的 100%，现在显示 No data。
+  - **D3**：面板 202 与 203 的描述改为与“只统计得出结论的检查”一致。
+- 文件位置：fork 侧为 `.plan/metrics/dae Transparent Proxy-Grafana_dashboard.json`；#1015 侧保留 `.plan/metrics/dae_Transparent_Proxy-Grafana_dashboard.json`。两者内容逐字节相同。
+- 校验结果：
+  - 程序化比对确认“结果等于对 v6 去环境化后再应用 D1–D3”；
+  - 引用的 27 个 `dae_*` 指标全部由修复后的采集器导出；
+  - 文件中不出现 `dae_node_`、`tcp4(DNS)` 或 `link`。
+
+### 7.5 #1015 说明评论
+
+本会话无法直接在 daeuniverse/dae 发评论：`add_repo` 因同名仓库目录冲突被拒，这是检出布局的限制，与权限无关。评论正文已交给仓库所有者手动发布。
 
 ## 8. 后续思考
 
